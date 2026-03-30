@@ -17,21 +17,13 @@ This app gives hosts a configurable grace period after a new sensor version appe
 
 Once the host is updated, the app automatically removes it from the force group.
 
-```
-Source Group (maintenance window)     Force Group (no blackout)
-+---------------------------------+   +---------------------------+
-| Policy: N-2, blackout 9AM-5PM  |   | Policy: N-2, no blackout  |
-| All managed hosts live here     |   | Only stragglers land here |
-+---------------------------------+   +---------------------------+
-         |                                       ^
-         | Host misses maintenance               | Phase B adds
-         | window for 3+ days                    | stale hosts
-         +---------------------------------------+
-                                                 |
-         +---------------------------------------+
-         | Phase A removes host once             |
-         | it reaches the target version         v
-         +---------------------------------------+
+```mermaid
+flowchart LR
+    SRC["<b>Source Group</b><br/>Policy: N-2<br/>Blackout: 9AM-5PM<br/>All managed hosts"]
+    FORCE["<b>Force Group</b><br/>Policy: N-2<br/>No blackout<br/>Only stragglers"]
+
+    SRC -- "Host misses maintenance<br/>window for 3+ days<br/><i>(Phase B)</i>" --> FORCE
+    FORCE -- "Host reaches target version<br/><i>(Phase A)</i>" --> SRC
 ```
 
 ## How It Works
