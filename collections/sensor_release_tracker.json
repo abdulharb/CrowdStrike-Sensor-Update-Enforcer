@@ -1,0 +1,83 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema",
+    "x-cs-indexable-fields": [
+        {
+            "field": "/platform",
+            "type": "string",
+            "fql_name": "platform"
+        },
+        {
+            "field": "/release_standing",
+            "type": "string",
+            "fql_name": "release_standing"
+        },
+        {
+            "field": "/first_seen_timestamp",
+            "type": "integer",
+            "fql_name": "first_seen_timestamp"
+        },
+        {
+            "field": "/standing_updated_timestamp",
+            "type": "integer",
+            "fql_name": "standing_updated_timestamp"
+        }
+    ],
+    "type": "object",
+    "properties": {
+        "platform": {
+            "type": "string",
+            "description": "OS Platform (Windows, Linux, Mac)"
+        },
+        "sensor_version": {
+            "type": "string",
+            "description": "The full semantic version string (e.g., 7.32.20403 (LTS))"
+        },
+        "release_standing": {
+            "type": "string",
+            "description": "The current N version status (e.g., n, n-1, n-2, untagged)"
+        },
+        "build_number": {
+            "type": "string",
+            "description": "The specific build number (e.g., 20403)"
+        },
+        "raw_build_string": {
+            "type": "string",
+            "description": "The original raw build string from the API (e.g., 20403|n-1|tagged|1)"
+        },
+        "stage": {
+            "type": "string",
+            "description": "Production stage (e.g., prod)"
+        },
+        "first_seen_timestamp": {
+            "type": "integer",
+            "description": "Unix timestamp of when this build was first detected."
+        },
+        "standing_updated_timestamp": {
+            "type": "integer",
+            "description": "Unix timestamp of when the release_standing was last changed."
+        },
+        "previous_standings": {
+            "type": "array",
+            "description": "Audit trail of previous standing values this build held.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "standing": {
+                        "type": "string",
+                        "description": "The previous standing value"
+                    },
+                    "timestamp": {
+                        "type": "integer",
+                        "description": "Unix timestamp when this standing was first observed"
+                    }
+                }
+            }
+        }
+    },
+    "required": [
+        "platform",
+        "sensor_version",
+        "release_standing",
+        "first_seen_timestamp"
+    ]
+}

@@ -1,0 +1,63 @@
+/* ─── Badge variants using Toucan status colors ─────── */
+
+.badge-positive {
+  background-color: color-mix(in srgb, var(--positive) 12%, transparent);
+  color: var(--positive);
+  border-color: color-mix(in srgb, var(--positive) 25%, transparent);
+}
+
+.badge-medium {
+  background-color: color-mix(in srgb, var(--medium) 12%, transparent);
+  color: var(--medium);
+  border-color: color-mix(in srgb, var(--medium) 25%, transparent);
+}
+
+.badge-high {
+  background-color: color-mix(in srgb, var(--high) 12%, transparent);
+  color: var(--high);
+  border-color: color-mix(in srgb, var(--high) 25%, transparent);
+}
+
+.badge-neutral {
+  background-color: color-mix(in srgb, var(--disabled) 12%, transparent);
+  color: var(--disabled);
+  border-color: color-mix(in srgb, var(--disabled) 25%, transparent);
+}
+
+.badge-informational {
+  background-color: color-mix(in srgb, var(--informational) 12%, transparent);
+  color: var(--informational);
+  border-color: color-mix(in srgb, var(--informational) 25%, transparent);
+}
+
+.badge-purple {
+  background-color: color-mix(in srgb, var(--purple) 12%, transparent);
+  color: var(--purple);
+  border-color: color-mix(in srgb, var(--purple) 25%, transparent);
+}
+
+/* ─── Status dot glow ────────────────────────────────── */
+
+.status-dot-current {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--informational) 60%, transparent);
+}
+
+/* ─── Scrollbar ──────────────────────────────────────── */
+
+.tracker-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.tracker-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tracker-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-faint);
+  border-radius: 3px;
+}
+
+.tracker-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--border-reg);
+}

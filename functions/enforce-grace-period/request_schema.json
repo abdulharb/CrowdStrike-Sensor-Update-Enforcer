@@ -1,0 +1,26 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema",
+    "type": "object",
+    "properties": {
+        "grace_period_days": {
+            "type": "integer",
+            "description": "Override the GRACE_PERIOD_DAYS environment variable. Number of days to wait after a new sensor version appears before enforcing updates.",
+            "minimum": 0,
+            "maximum": 90
+        },
+        "platforms": {
+            "type": "array",
+            "description": "Override the PLATFORMS environment variable. List of platforms to enforce.",
+            "items": {
+                "type": "string",
+                "enum": ["windows", "mac", "linux"]
+            }
+        },
+        "dry_run": {
+            "type": "boolean",
+            "description": "If true, report what actions would be taken without making any changes. Defaults to false.",
+            "default": false
+        }
+    },
+    "additionalProperties": false
+}

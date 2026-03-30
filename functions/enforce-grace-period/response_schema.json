@@ -1,0 +1,114 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema",
+    "type": "object",
+    "properties": {
+        "success": {
+            "type": "boolean",
+            "description": "Whether the operation completed without errors"
+        },
+        "dry_run": {
+            "type": "boolean",
+            "description": "Whether this was a dry run (no changes made)"
+        },
+        "timestamp": {
+            "type": "integer",
+            "description": "Unix timestamp of execution"
+        },
+        "grace_period_days": {
+            "type": "integer",
+            "description": "Grace period used for this run"
+        },
+        "policy_targets": {
+            "type": "object",
+            "description": "Detected target standing per platform from source group policy (e.g. {windows: 'n-2'})"
+        },
+        "cleanup": {
+            "type": "object",
+            "description": "Phase A results - removing hosts that now meet the source policy target",
+            "properties": {
+                "hosts_evaluated": {
+                    "type": "integer",
+                    "description": "Total hosts currently in force update group"
+                },
+                "hosts_removed": {
+                    "type": "integer",
+                    "description": "Hosts removed because they now meet the source policy baseline"
+                },
+                "removed_hosts": {
+                    "type": "array",
+                    "description": "Details of removed hosts",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "device_id": { "type": "string" },
+                            "hostname": { "type": "string" },
+                            "platform": { "type": "string" },
+                            "agent_version": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        },
+        "enforcement": {
+            "type": "object",
+            "description": "Phase B results - adding stale source group hosts to force group",
+            "properties": {
+                "platforms_checked": {
+                    "type": "integer",
+                    "description": "Number of platforms evaluated"
+                },
+                "platforms_expired": {
+                    "type": "integer",
+                    "description": "Number of platforms where grace period has expired"
+                },
+                "hosts_added": {
+                    "type": "integer",
+                    "description": "Total stale hosts added to force update group"
+                },
+                "platform_details": {
+                    "type": "array",
+                    "description": "Per-platform enforcement details",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "platform": { "type": "string" },
+                            "target_standing": { "type": "string", "description": "Standing from source policy (e.g. n-2)" },
+                            "target_version": { "type": "string", "description": "Current sensor version at that standing" },
+                            "policy_name": { "type": "string" },
+                            "first_seen_timestamp": { "type": "integer" },
+                            "grace_period_expired": { "type": "boolean" },
+                            "days_since_release": { "type": "number" },
+                            "stale_hosts_found": { "type": "integer" },
+                            "hosts_added": { "type": "integer" }
+                        }
+                    }
+                },
+                "added_hosts": {
+                    "type": "array",
+                    "description": "Details of hosts added to force update group",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "device_id": { "type": "string" },
+                            "hostname": { "type": "string" },
+                            "platform": { "type": "string" },
+                            "agent_version": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        },
+        "errors": {
+            "type": "array",
+            "description": "List of errors encountered, or null if none",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string" },
+                    "error": { "type": "string" }
+                }
+            }
+        }
+    },
+    "required": ["success", "dry_run", "timestamp", "grace_period_days", "policy_targets", "cleanup", "enforcement"]
+}

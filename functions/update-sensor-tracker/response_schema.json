@@ -1,0 +1,95 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema",
+    "type": "object",
+    "properties": {
+        "success": {
+            "type": "boolean",
+            "description": "Indicates if the operation was successful"
+        },
+        "timestamp": {
+            "type": "integer",
+            "description": "Unix timestamp when the update was performed"
+        },
+        "summary": {
+            "type": "object",
+            "properties": {
+                "total_api_records": {
+                    "type": "integer",
+                    "description": "Total number of records retrieved from the API"
+                },
+                "new_entries_created": {
+                    "type": "integer",
+                    "description": "Number of new entries added to the collection"
+                },
+                "entries_updated": {
+                    "type": "integer",
+                    "description": "Number of existing entries whose standing was updated"
+                },
+                "existing_entries_skipped": {
+                    "type": "integer",
+                    "description": "Number of existing entries that were skipped (no change)"
+                },
+                "errors": {
+                    "type": "integer",
+                    "description": "Number of errors encountered"
+                }
+            },
+            "required": [
+                "total_api_records",
+                "new_entries_created",
+                "entries_updated",
+                "existing_entries_skipped",
+                "errors"
+            ]
+        },
+        "new_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "object_key": { "type": "string" },
+                    "platform": { "type": "string" },
+                    "release_standing": { "type": "string" },
+                    "build_number": { "type": "string" },
+                    "sensor_version": { "type": "string" },
+                    "first_seen_timestamp": { "type": "integer" }
+                }
+            }
+        },
+        "updated_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "object_key": { "type": "string" },
+                    "platform": { "type": "string" },
+                    "old_standing": { "type": "string" },
+                    "new_standing": { "type": "string" },
+                    "build_number": { "type": "string" }
+                }
+            }
+        },
+        "skipped_entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "object_key": { "type": "string" },
+                    "platform": { "type": "string" },
+                    "release_standing": { "type": "string" },
+                    "build_number": { "type": "string" }
+                }
+            }
+        },
+        "errors": {
+            "type": "array",
+            "description": "List of errors encountered during processing, empty if none",
+            "items": { "type": "object" }
+        }
+    },
+    "required": [
+        "success",
+        "timestamp",
+        "summary"
+    ]
+}

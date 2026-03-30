@@ -1,0 +1,27 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema",
+    "type": "object",
+    "properties": {
+        "platforms": {
+            "type": "array",
+            "description": "List of OS platforms to query sensor builds for. Allowed values: windows, mac, linux. Defaults to [\"windows\"] if not provided.",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "windows",
+                    "mac",
+                    "linux"
+                ]
+            },
+            "default": [
+                "windows"
+            ]
+        },
+        "stage": {
+            "type": "string",
+            "description": "The stage to query sensor builds for (e.g. \"prod\"). Defaults to \"prod\" if not provided.",
+            "default": "prod"
+        }
+    },
+    "additionalProperties": false
+}

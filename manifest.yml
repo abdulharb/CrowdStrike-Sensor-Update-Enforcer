@@ -1,0 +1,122 @@
+app_id: f8238086a4d84124810736bbbd029c99
+name: Sensor Update Enforcer
+description: Enforces sensor update grace periods by moving stale hosts to a force-update group
+logo: ""
+vendor: ""
+vendor_products: []
+use_case: Utilities
+manifest_version: "2023-05-09"
+ignored:
+    - .+/node_modules$
+    - .+/node_modules/.+
+    - .+/venv$
+    - .+/venv/.+
+ui:
+    homepage: pages.sensor_release_tracker
+    extensions: []
+    pages:
+        sensor_release_tracker:
+            id: af050d3d67cc4fb38a6c1a22b9798082
+            name: Sensor Release Tracker
+            description: Dashboard to view sensor release standings and update history
+            path: ui/pages/Sensor Release Tracker/src/dist
+            entrypoint: ui/pages/Sensor Release Tracker/src/dist/index.html
+            content_security_policy:
+                connect-src: []
+                style-src: []
+                style-src-elem: []
+                script-src: []
+                form-action: []
+                img-src: []
+                media-src: []
+                object-src: []
+            permissions: []
+    dashboards: {}
+    navigation:
+        id: 08592e75dd3148ab95c1f71e293e2695
+        links:
+            - path: /sensor-release-tracker
+              name: Sensor Release Tracker
+              permissions: []
+              ref: pages.sensor_release_tracker
+api_integrations:
+    - id: e8e44a74d59548c580906275e27106be
+      name: CrowdStrike API
+      description: CrowdStrike API
+      path: api-integrations/CrowdStrike API Foundry.json
+rtr_scripts: []
+collections:
+    - name: sensor_release_tracker
+      description: Tracks the rolling release standings of Falcon sensors. Used to detect version changes and store first_seen timestamps for calculating update grace periods.
+      schema: collections/sensor_release_tracker.json
+      permissions: []
+      workflow_integration: null
+auth:
+    scopes:
+        - sensor-update-policies:read
+        - devices:read
+        - host-group:read
+        - host-group:write
+    permissions: {}
+    roles: []
+functions:
+    - id: bf81b352100a480db742a104b4d352c6
+      name: update-sensor-tracker
+      config: null
+      description: Updates the sensor release tracker collection with data from the CrowdStrike sensor builds API
+      path: functions/update-sensor-tracker
+      environment_variables:
+        DEBUG_MODE: "true"
+      handlers:
+        - name: update-sensor-tracker
+          description: Updates the sensor release tracker collection with data from the CrowdStrike sensor builds API
+          method: POST
+          api_path: /update-sensor-tracker
+          payload_type: ""
+          request_schema: request_schema.json
+          response_schema: response_schema.json
+          workflow_integration:
+            id: c5b315a0f9e94c7786ae0b94b56a3b7e
+            disruptive: false
+            system_action: true
+            tags:
+                - f8238086a4d84124810736bbbd029c99
+                - Sensor Update Enforcer
+          permissions: []
+      language: python
+      max_exec_duration_seconds: 900
+    - id: db503e3203e3438b950bee7dae9ef332
+      name: enforce-grace-period
+      config: null
+      description: Enforces sensor update grace period by managing force update host group membership
+      path: functions/enforce-grace-period
+      environment_variables:
+        DEBUG_MODE: "true"
+        FORCE_UPDATE_GROUP_ID: ""
+        GRACE_PERIOD_DAYS: "3"
+        PLATFORMS: windows
+        SOURCE_GROUP_ID: ""
+      handlers:
+        - name: enforce-grace-period
+          description: Enforces sensor update grace period by managing force update host group membership
+          method: POST
+          api_path: /enforce-grace-period
+          payload_type: ""
+          request_schema: request_schema.json
+          response_schema: response_schema.json
+          workflow_integration:
+            id: 0ed71c20724f4660be4a1b9d1c3629d5
+            disruptive: true
+            system_action: true
+            tags:
+                - f8238086a4d84124810736bbbd029c99
+                - Sensor Update Enforcer
+          permissions: []
+      language: python
+      max_exec_duration_seconds: 900
+workflows: []
+parsers: []
+logscale:
+    saved_searches: []
+lookup_files: []
+docs: {}
