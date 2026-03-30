@@ -1,5 +1,8 @@
 # Sensor Update Enforcer
 
+> [!CAUTION]
+> This project is a work in prog-mess. I haven't had the chance to fully battle test this code yet and it's likely missing some things, so **please don't use this in production**. If you do, it's at your own risk -- the code may behave in unexpected ways. I'm hoping to have everything fully complete and tested in the next 2-3 weeks. For now I'm putting this out there just to get something on the internet.
+
 A [CrowdStrike Falcon Foundry](https://www.crowdstrike.com/platform/foundry/) app that ensures hosts stay up-to-date with their sensor update policy, even when they're only online during blackout windows.
 
 Built with Falcon Foundry Functions (Python) and Foundry Collections for state management. Runs as scheduled Foundry workflows -- no external infrastructure required.
