@@ -39,11 +39,7 @@ ui:
               name: Sensor Release Tracker
               permissions: []
               ref: pages.sensor_release_tracker
-api_integrations:
-    - id: e8e44a74d59548c580906275e27106be
-      name: CrowdStrike API
-      description: CrowdStrike API
-      path: api-integrations/CrowdStrike API Foundry.json
+api_integrations: []
 rtr_scripts: []
 collections:
     - name: sensor_release_tracker
@@ -92,10 +88,10 @@ functions:
       path: functions/enforce-grace-period
       environment_variables:
         DEBUG_MODE: "true"
-        FORCE_UPDATE_GROUP_ID: ""
+        FORCE_UPDATE_GROUP_ID: "03785fa2701d4f27b2be8e211be83b6c"
         GRACE_PERIOD_DAYS: "3"
         PLATFORMS: windows
-        SOURCE_GROUP_ID: ""
+        SOURCE_GROUP_ID: "5d843342754442dab0c0a94e093aa18c"
       handlers:
         - name: enforce-grace-period
           description: Enforces sensor update grace period by managing force update host group membership
