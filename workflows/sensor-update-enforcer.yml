@@ -1,16 +1,25 @@
 # Created by https://github.com/eth0izzle/security-skills/
 name: Sensor Update Enforcer
-description: Tracks sensor release standings then enforces grace periods. Step 1 updates the collection with current version data, sleeps 10 minutes, then Step 2 cleans up updated hosts and adds stale hosts to the force update group. Runs every 4 hours.
+description: Tracks sensor release standings then enforces grace periods. Step 1 updates the collection with current version data, sleeps 10 minutes, then Step 2 cleans up updated hosts and adds stale hosts to the force update group. Schedule this workflow to run every 4 hours.
 parameters: {}
 provision_on_install: true
 trigger:
     next:
         - UpdateSensorTracker
-    name: Scheduled
-    type: Scheduled
-    schedule:
-        cron: "0 */4 * * *"
-        timezone: UTC
+    name: On demand
+    type: On demand
+    parameters:
+        $schema: https://json-schema.org/draft-07/schema
+        properties:
+            dry_run:
+                type: boolean
+                title: Dry Run
+                description: Preview enforcement changes without modifying host group membership
+            grace_period_days:
+                type: integer
+                title: Grace Period Days
+                description: Override the default grace period (0 for immediate enforcement)
+        type: object
 actions:
     UpdateSensorTracker:
         id: functions.update-sensor-tracker.update-sensor-tracker
