@@ -90,7 +90,7 @@ functions:
         DEBUG_MODE: "true"
         FORCE_UPDATE_GROUP_ID: 03785fa2701d4f27b2be8e211be83b6c
         GRACE_PERIOD_DAYS: "3"
-        PLATFORMS: windows
+        PLATFORMS: windows,mac,linux
         SOURCE_GROUP_ID: 5d843342754442dab0c0a94e093aa18c
       handlers:
         - name: enforce-grace-period

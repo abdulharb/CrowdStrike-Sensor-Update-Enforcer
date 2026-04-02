@@ -23,6 +23,8 @@ actions:
         properties:
             platforms:
                 - windows
+                - mac
+                - linux
     Sleep:
         id: 4f1af1ae4c13dc1e3bcd725f8dc0f63b
         default_name: Sleep
