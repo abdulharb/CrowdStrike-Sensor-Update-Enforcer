@@ -1,4 +1,4 @@
-app_id: f8238086a4d84124810736bbbd029c99
+app_id: c91e0014171f425faafa60acc6f996fd
 name: Sensor Update Enforcer
 description: Enforces sensor update grace periods by moving stale hosts to a force-update group
 logo: ""
@@ -76,7 +76,7 @@ functions:
             disruptive: false
             system_action: true
             tags:
-                - f8238086a4d84124810736bbbd029c99
+                - c91e0014171f425faafa60acc6f996fd
                 - Sensor Update Enforcer
           permissions: []
       language: python
@@ -105,7 +105,7 @@ functions:
             disruptive: true
             system_action: true
             tags:
-                - f8238086a4d84124810736bbbd029c99
+                - c91e0014171f425faafa60acc6f996fd
                 - Sensor Update Enforcer
           permissions: []
       language: python
