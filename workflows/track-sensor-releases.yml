@@ -1,0 +1,25 @@
+# Created by https://github.com/eth0izzle/security-skills/
+name: Track Sensor Releases
+description: Polls CrowdStrike sensor builds API and updates the sensor release tracker collection with current version standings. Run on a schedule (every 4-6 hours).
+trigger:
+    next:
+        - UpdateSensorTracker
+    name: On demand
+    type: On demand
+    parameters:
+        $schema: https://json-schema.org/draft-07/schema
+        properties:
+            platforms:
+                type: array
+                items:
+                    type: string
+                title: Platforms
+                description: Platforms to track (windows, mac, linux)
+        type: object
+actions:
+    UpdateSensorTracker:
+        id: bf81b352100a480db742a104b4d352c6_c5b315a0f9e94c7786ae0b94b56a3b7e
+        name: update-sensor-tracker
+        properties:
+            platforms:
+                - windows

@@ -1,0 +1,25 @@
+# Created by https://github.com/eth0izzle/security-skills/
+name: Enforce Grace Period
+description: Enforces sensor update grace periods by cleaning up updated hosts and adding stale hosts to the force update group. Run on a schedule (every 4-6 hours, offset from Track Sensor Releases).
+trigger:
+    next:
+        - EnforceGracePeriod
+    name: On demand
+    type: On demand
+    parameters:
+        $schema: https://json-schema.org/draft-07/schema
+        properties:
+            dry_run:
+                type: boolean
+                title: Dry Run
+                description: Preview changes without modifying host group membership
+            grace_period_days:
+                type: integer
+                title: Grace Period Days
+                description: Override the default grace period (0 for immediate enforcement)
+        type: object
+actions:
+    EnforceGracePeriod:
+        id: db503e3203e3438b950bee7dae9ef332_0ed71c20724f4660be4a1b9d1c3629d5
+        name: enforce-grace-period
+        properties: {}
