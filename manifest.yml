@@ -113,6 +113,7 @@ functions:
 workflows:
     - id: a1b2c3d4e5f64789abcdef0123456aab
       name: Sensor Update Enforcer
+      description: Runs every 4 hours. Tracks sensor release standings in a collection, sleeps 10 minutes, then enforces grace periods by moving stale hosts to a force-update group and cleaning up hosts that have updated.
       path: workflows/sensor-update-enforcer.yml
       permissions: []
 parsers: []

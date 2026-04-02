@@ -1,6 +1,6 @@
 # Created by https://github.com/eth0izzle/security-skills/
 name: Sensor Update Enforcer
-description: Tracks sensor release standings then enforces grace periods. Step 1 updates the collection with current version data, sleeps 10 minutes, then Step 2 cleans up updated hosts and adds stale hosts to the force update group. Runs every 4 hours.
+description: Runs every 4 hours. Tracks sensor release standings in a collection, sleeps 10 minutes, then enforces grace periods by moving stale hosts to a force-update group and cleaning up hosts that have updated.
 parameters: {}
 provision_on_install: true
 trigger:
