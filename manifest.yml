@@ -62,7 +62,7 @@ functions:
       description: Updates the sensor release tracker collection
       path: functions/update-sensor-tracker
       environment_variables:
-        DEBUG_MODE: "false"
+        DEBUG_MODE: "true"
       handlers:
         - name: update-sensor-tracker
           description: Updates the sensor release tracker collection
@@ -87,7 +87,7 @@ functions:
       description: Enforces sensor update grace period by managing force update host group membership
       path: functions/enforce-grace-period
       environment_variables:
-        DEBUG_MODE: "false"
+        DEBUG_MODE: "true"
         FORCE_UPDATE_GROUP_ID: 03785fa2701d4f27b2be8e211be83b6c
         GRACE_PERIOD_DAYS: "3"
         PLATFORMS: windows,mac,linux
