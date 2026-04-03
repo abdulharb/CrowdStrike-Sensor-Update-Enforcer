@@ -1,5 +1,5 @@
 # Created by https://github.com/eth0izzle/security-skills/
-name: Sensor Update Enforcer - Scheduled Run
+name: Sensor Update Enforcer - Scheduled
 description: Runs every 4 hours. Tracks sensor release standings in a collection, sleeps 10 minutes, then enforces grace periods by moving stale hosts to a force-update group and cleaning up hosts that have updated.
 parameters: {}
 provision_on_install: true
@@ -7,7 +7,7 @@ trigger:
     next:
         - UpdateSensorTracker
     event: Schedule
-    name: Sensor Update Enforcer - Scheduled Run
+    name: Sensor Update Enforcer - Scheduled
     schedule:
         time_cycle: 0 0/4 * * *
         start_date: ""

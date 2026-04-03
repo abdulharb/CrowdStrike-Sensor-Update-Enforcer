@@ -112,7 +112,7 @@ functions:
       max_exec_duration_seconds: 900
 workflows:
     - id: a14c82afa42e46ba8aec87a9c3f72b4b
-      name: Sensor Update Enforcer - Scheduled Run
+      name: Sensor Update Enforcer - Scheduled
       path: workflows/workflow.yml
       permissions: []
 parsers: []
