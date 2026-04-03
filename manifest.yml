@@ -1,4 +1,4 @@
-app_id: 60464f5ad129424d81f18ce1b714b493
+app_id: 2b2c43d6c3074ae28632a8feae183ce9
 name: Sensor Update Enforcer
 description: Enforces sensor update grace periods by moving stale hosts to a force-update group
 logo: ""
@@ -16,7 +16,7 @@ ui:
     extensions: []
     pages:
         sensor_release_tracker:
-            id: af050d3d67cc4fb38a6c1a22b9798082
+            id: d44ea32a175c4b8991da56aacec51c54
             name: Sensor Release Tracker
             description: Dashboard to view sensor release standings and update history
             path: ui/pages/Sensor Release Tracker/src/dist
@@ -33,7 +33,7 @@ ui:
             permissions: []
     dashboards: {}
     navigation:
-        id: 08592e75dd3148ab95c1f71e293e2695
+        id: 6a4c1982b0184596832ec7bf78c66fb2
         links:
             - path: /sensor-release-tracker
               name: Sensor Release Tracker
@@ -56,32 +56,32 @@ auth:
     permissions: {}
     roles: []
 functions:
-    - id: 69e99e9cb9c941259b183f24264dbc8a
+    - id: ab6994a989ca455ca838fa7f066cb5ed
       name: update-sensor-tracker
       config: null
-      description: Updates the sensor release tracker collection with data from the CrowdStrike sensor builds API
+      description: Updates the sensor release tracker collection
       path: functions/update-sensor-tracker
       environment_variables:
         DEBUG_MODE: "false"
       handlers:
         - name: update-sensor-tracker
-          description: Updates the sensor release tracker collection with data from the CrowdStrike sensor builds API
+          description: Updates the sensor release tracker collection
           method: POST
           api_path: /update-sensor-tracker
           payload_type: ""
           request_schema: request_schema.json
           response_schema: response_schema.json
           workflow_integration:
-            id: e17220865fb14f7793838ac0f420552b
+            id: c0a8d8ea3bde4e9992cca887d0ec44bb
             disruptive: false
             system_action: true
             tags:
-                - 60464f5ad129424d81f18ce1b714b493
+                - 2b2c43d6c3074ae28632a8feae183ce9
                 - Sensor Update Enforcer
           permissions: []
       language: python
       max_exec_duration_seconds: 900
-    - id: ca853598a24041e2a66fd5cca328172a
+    - id: 06e917cffb1f470ea6c13e07ed8c28df
       name: enforce-grace-period
       config: null
       description: Enforces sensor update grace period by managing force update host group membership
@@ -101,11 +101,11 @@ functions:
           request_schema: request_schema.json
           response_schema: response_schema.json
           workflow_integration:
-            id: dbbb3243d315457eb96109ad9f7a62ff
+            id: 50d46ca8c43749f2b0ce6fc8c5018038
             disruptive: true
             system_action: true
             tags:
-                - 60464f5ad129424d81f18ce1b714b493
+                - 2b2c43d6c3074ae28632a8feae183ce9
                 - Sensor Update Enforcer
           permissions: []
       language: python
@@ -113,7 +113,7 @@ functions:
 workflows:
     - id: b7a8c9d0e1f243567890abcdef123456
       name: Sensor Update Enforcer - Scheduled Run
-      description: Runs every 4 hours. Tracks sensor release standings, sleeps 10 minutes, then enforces grace periods on stale hosts.
+      description: Runs every 4 hours to track sensor releases and enforce grace periods on stale hosts.
       path: workflows/sensor-update-enforcer.yml
       permissions: []
 parsers: []
