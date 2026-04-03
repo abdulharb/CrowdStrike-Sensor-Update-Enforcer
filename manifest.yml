@@ -88,10 +88,10 @@ functions:
       path: functions/enforce-grace-period
       environment_variables:
         DEBUG_MODE: "false"
-        FORCE_UPDATE_GROUP_ID: "03785fa2701d4f27b2be8e211be83b6c"
+        FORCE_UPDATE_GROUP_ID: 03785fa2701d4f27b2be8e211be83b6c
         GRACE_PERIOD_DAYS: "3"
-        PLATFORMS: "windows,mac,linux"
-        SOURCE_GROUP_ID: "5d843342754442dab0c0a94e093aa18c"
+        PLATFORMS: windows,mac,linux
+        SOURCE_GROUP_ID: 5d843342754442dab0c0a94e093aa18c
       handlers:
         - name: enforce-grace-period
           description: Enforces sensor update grace period by managing force update host group membership
@@ -111,10 +111,9 @@ functions:
       language: python
       max_exec_duration_seconds: 900
 workflows:
-    - id: b7a8c9d0e1f243567890abcdef123456
+    - id: a14c82afa42e46ba8aec87a9c3f72b4b
       name: Sensor Update Enforcer - Scheduled Run
-      description: Runs every 4 hours to track sensor releases and enforce grace periods on stale hosts.
-      path: workflows/sensor-update-enforcer.yml
+      path: workflows/workflow.yml
       permissions: []
 parsers: []
 logscale:
