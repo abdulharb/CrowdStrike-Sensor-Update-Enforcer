@@ -78,6 +78,23 @@ def get_headers() -> Dict[str, str]:
     return headers
 
 
+def extract_error_message(response: Dict[str, Any]) -> str:
+    """Pull a human-readable message from a falconpy response.
+
+    Errors live under body.errors (a list of {code, message}); there is no
+    top-level "error" key, so reading response["error"] always yields nothing.
+    """
+    if not isinstance(response, dict):
+        return "Unknown error"
+    errors = response.get("body", {}).get("errors", [])
+    if isinstance(errors, list) and errors:
+        msgs = [e.get("message", "") for e in errors
+                if isinstance(e, dict) and e.get("message")]
+        if msgs:
+            return "; ".join(msgs)
+    return "Unknown error"
+
+
 def read_existing_record(
     api_client: APIHarnessV2,
     collection_name: str,
@@ -170,13 +187,11 @@ def update_sensor_tracker_handler(
                 platform=platform, stage=stage
             )
 
-            if sensor_response["status_code"] != 200:
-                error_message = (
-                    sensor_response.get("error", {}).get("message", "Unknown error")
-                )
+            if sensor_response.get("status_code") != 200:
+                error_message = extract_error_message(sensor_response)
                 logger.error(f"Failed to fetch sensor builds for {platform}: {error_message}")
                 return Response(
-                    code=sensor_response["status_code"],
+                    code=sensor_response.get("status_code", 500),
                     errors=[
                         APIError(
                             code=sensor_response["status_code"],
@@ -254,17 +269,13 @@ def update_sensor_tracker_handler(
                 if existing is not None:
                     old_standing = existing.get("release_standing", "")
 
-                    # Never downgrade a tagged standing to untagged.
-                    # The API returns builds in both tagged and untagged form.
-                    if release_standing == "untagged" and old_standing in STANDING_PRIORITY:
-                        log_debug(logger, f"Skipping downgrade {old_standing} -> untagged: {object_key}")
-                        skipped_entries.append({
-                            "object_key": object_key,
-                            "platform": platform,
-                            "release_standing": old_standing,
-                            "build_number": build_number,
-                        })
-                        continue
+                    # Note: the API's tagged/untagged duplicate of a still-tagged
+                    # build is already skipped above (object_key in tagged_this_run).
+                    # So an untagged build reaching here with a tagged stored
+                    # standing has genuinely aged out of the n/n-1/n-2 window and
+                    # falls through to the standing-changed path below, which
+                    # demotes it to untagged. This keeps exactly one build per
+                    # standing instead of letting aged-out builds pile up.
 
                     if old_standing == release_standing:
                         # No change
@@ -315,7 +326,7 @@ def update_sensor_tracker_handler(
                             "build_number": build_number,
                         })
                     else:
-                        error_msg = put_response.get("error", {}).get("message", "Unknown error")
+                        error_msg = extract_error_message(put_response)
                         errors.append({"object_key": object_key, "error": f"Failed to update: {error_msg}"})
                         logger.error(f"Failed to update {object_key}: {error_msg}")
                 else:
@@ -352,7 +363,7 @@ def update_sensor_tracker_handler(
                         })
                         logger.info(f"Created new entry: {object_key}")
                     else:
-                        error_msg = put_response.get("error", {}).get("message", "Unknown error")
+                        error_msg = extract_error_message(put_response)
                         errors.append({"object_key": object_key, "error": f"Failed to store: {error_msg}"})
                         logger.error(f"Failed to store {object_key}: {error_msg}")
 

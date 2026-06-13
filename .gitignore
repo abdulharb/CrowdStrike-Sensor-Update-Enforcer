@@ -5,3 +5,9 @@ __pycache__/
 venv/
 node_modules/
 .env
+.pytest_cache/
+
+# Local recon / credentials (never commit)
+recon.py
+.falcon_env
+*.creds

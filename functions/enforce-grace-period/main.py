@@ -205,6 +205,19 @@ def is_current(agent_version: str, target_version: str) -> bool:
     return parse_version(agent_version) >= parse_version(target_version)
 
 
+def has_known_version(agent_version: str) -> bool:
+    """True only if the host reported a parseable, non-empty sensor version.
+
+    Hosts with a missing or garbage agent_version are NOT enforced: forcing an
+    update off absent data risks disrupting hosts whose version simply wasn't
+    reported (e.g. long-offline devices with stale records). Such hosts are
+    logged and skipped rather than added to the force group.
+    """
+    if not agent_version or not agent_version.strip():
+        return False
+    return parse_version(agent_version) != (0, 0, 0)
+
+
 # ---------------------------------------------------------------------------
 # Source policy detection
 # ---------------------------------------------------------------------------
@@ -388,15 +401,23 @@ def get_target_versions(
                         if isinstance(body, dict) and "sensor_version" in body:
                             entry = body
 
+                # Grace is measured from when the build REACHED the target
+                # standing (its promotion) -- standing_updated_timestamp -- not
+                # when it first appeared (which, for an n-1/n-2 target, predates
+                # the promotion by weeks and would make grace a no-op). Fall back
+                # to first_seen for older records that predate this field.
+                first_seen = entry.get("first_seen_timestamp", 0)
+                promoted_at = entry.get("standing_updated_timestamp", 0) or first_seen
                 target_versions[platform] = {
                     "sensor_version": entry.get("sensor_version", ""),
-                    "first_seen_timestamp": entry.get("first_seen_timestamp", 0),
+                    "first_seen_timestamp": first_seen,
+                    "standing_updated_timestamp": promoted_at,
                     "target_standing": standing,
                     "policy_name": target_info.get("policy_name", ""),
                 }
                 logger.info(f"{platform}: Current '{standing}' is version "
                             f"{target_versions[platform]['sensor_version']} "
-                            f"(first seen: {target_versions[platform]['first_seen_timestamp']})")
+                            f"(promoted: {promoted_at}, first seen: {first_seen})")
             else:
                 logger.warning(f"{platform}: No '{standing}' version found in collection. "
                                f"Has update-sensor-tracker run?")
@@ -582,8 +603,16 @@ def find_stale_hosts_in_source(
             if device_id in existing_force_member_ids:
                 continue
 
-            # Check if the host is behind the target version
+            # Don't enforce on hosts with no reliable version data -- skip+log
+            # instead of force-updating off (0,0,0).
             agent_ver = device.get("agent_version", "")
+            if not has_known_version(agent_ver):
+                logger.warning(f"Skipping {device.get('hostname', '?')} "
+                               f"({device_id[:8]}) - missing/unparseable "
+                               f"agent_version {agent_ver!r}; not enforcing")
+                continue
+
+            # Check if the host is behind the target version
             if not is_current(agent_ver, target_version):
                 stale_hosts.append(device)
 
@@ -721,6 +750,7 @@ def enforce_grace_period_handler(
                     "target_version": "",
                     "policy_name": policy_targets.get(platform, {}).get("policy_name", ""),
                     "first_seen_timestamp": 0,
+                    "standing_updated_timestamp": 0,
                     "grace_period_expired": False,
                     "days_since_release": 0,
                     "stale_hosts_found": 0,
@@ -729,8 +759,10 @@ def enforce_grace_period_handler(
                 continue
 
             version_info = target_versions[platform]
-            first_seen = version_info["first_seen_timestamp"]
-            elapsed = now - first_seen
+            # Grace counts from when the build was promoted to the target
+            # standing, so GRACE_PERIOD_DAYS actually applies for n-1/n-2 targets.
+            promoted_at = version_info["standing_updated_timestamp"]
+            elapsed = now - promoted_at
             days_since = round(elapsed / 86400, 1)
             expired = elapsed >= grace_seconds
 
@@ -739,7 +771,8 @@ def enforce_grace_period_handler(
                 "target_standing": version_info["target_standing"],
                 "target_version": version_info["sensor_version"],
                 "policy_name": version_info.get("policy_name", ""),
-                "first_seen_timestamp": first_seen,
+                "first_seen_timestamp": version_info["first_seen_timestamp"],
+                "standing_updated_timestamp": promoted_at,
                 "grace_period_expired": expired,
                 "days_since_release": days_since,
                 "stale_hosts_found": 0,
