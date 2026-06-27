@@ -136,10 +136,14 @@ def device(device_id, agent_version, platform_name="Windows", hostname="host"):
     }
 
 
-def collection_record(sensor_version, first_seen, standing="n-2", policy_name="Force Update"):
+def collection_record(sensor_version, first_seen, standing="n-2", policy_name="Force Update",
+                      standing_updated=None):
+    # The real tracker sets standing_updated_timestamp on every record (= first_seen
+    # on creation, = promotion time on a standing change), so default it to first_seen.
     return {
         "sensor_version": sensor_version,
         "first_seen_timestamp": first_seen,
+        "standing_updated_timestamp": first_seen if standing_updated is None else standing_updated,
         "release_standing": standing,
         "policy_name": policy_name,
     }
@@ -460,6 +464,25 @@ def test_handler_grace_not_expired_skips_enforcement(monkeypatch):
     assert resp.body["enforcement"]["hosts_added"] == 0
     detail = resp.body["enforcement"]["platform_details"][0]
     assert detail["grace_period_expired"] is False
+    assert hg.actions == []
+
+
+def test_grace_legacy_record_without_promotion_ts_skips_enforcement(monkeypatch):
+    # Regression: a legacy record predating standing_updated_timestamp (value 0)
+    # must NOT fall back to first_seen and force-update instantly on deploy day.
+    # Enforcement is skipped until the tracker re-stamps the promotion date.
+    now = int(time.time())
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",))])
+    rec = collection_record("7.36.20805", first_seen=now - 60 * 86400, standing_updated=0)
+    store = FakeStore({("Windows", "n-2"): rec})
+    hg = FakeHostGroup({"FORCE": [], "SRC": [device("s_stale", "7.30.20000")]})
+    resp = _route(monkeypatch, sensor=sensor, hg=hg, store=store, body={}, env=BASE_ENV)
+
+    assert resp.code == 200
+    assert resp.body["enforcement"]["hosts_added"] == 0
+    detail = resp.body["enforcement"]["platform_details"][0]
+    assert detail["grace_period_expired"] is False
+    assert detail["standing_updated_timestamp"] == 0
     assert hg.actions == []
 
 

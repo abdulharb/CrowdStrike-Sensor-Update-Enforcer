@@ -424,5 +424,31 @@ def test_lts_sensor_version_stored_verbatim(monkeypatch):
     assert store.objects["linux_19102"]["sensor_version"] == "7.38.19102 (LTS)"
 
 
+def test_extract_error_message_body_none_no_crash():
+    # Regression: falconpy can return {"status_code": 5xx, "body": None}. The {}
+    # default only fires when 'body' is absent, not when it's present-but-None.
+    assert main.extract_error_message({"status_code": 500, "body": None}) == "Unknown error"
+    assert main.extract_error_message(
+        {"body": {"errors": [{"message": "boom"}]}}) == "boom"
+
+
+def test_build_fetch_error_without_status_code_surfaces_real_message(monkeypatch):
+    # Regression: when the build-fetch response omits status_code, the error path
+    # must not KeyError-crash into an opaque 500; it must report the upstream error.
+    class SensorNoStatus:
+        def query_combined_builds(self, platform, stage):
+            return {"body": {"errors": [{"code": 503, "message": "upstream unavailable"}]}}
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: FakeStore())
+    monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: SensorNoStatus())
+    req = Request(method="POST", url="/update-sensor-tracker",
+                  body={"platforms": ["linux"], "stage": "prod"})
+    resp = main.FUNC._router.route(req, logger=LOGGER)
+    assert resp.code == 500
+    msg = resp.errors[0].message
+    assert "upstream unavailable" in msg
+    assert "status_code" not in msg  # not the masked KeyError
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -404,10 +404,13 @@ def get_target_versions(
                 # Grace is measured from when the build REACHED the target
                 # standing (its promotion) -- standing_updated_timestamp -- not
                 # when it first appeared (which, for an n-1/n-2 target, predates
-                # the promotion by weeks and would make grace a no-op). Fall back
-                # to first_seen for older records that predate this field.
+                # the promotion by weeks and would make grace a no-op). Do NOT
+                # fall back to first_seen: legacy records without this field have
+                # no reliable promotion date, and anchoring to first_seen would
+                # make grace expire instantly. promoted_at==0 is handled below by
+                # skipping enforcement until update-sensor-tracker re-stamps it.
                 first_seen = entry.get("first_seen_timestamp", 0)
-                promoted_at = entry.get("standing_updated_timestamp", 0) or first_seen
+                promoted_at = entry.get("standing_updated_timestamp", 0)
                 target_versions[platform] = {
                     "sensor_version": entry.get("sensor_version", ""),
                     "first_seen_timestamp": first_seen,
@@ -762,6 +765,28 @@ def enforce_grace_period_handler(
             # Grace counts from when the build was promoted to the target
             # standing, so GRACE_PERIOD_DAYS actually applies for n-1/n-2 targets.
             promoted_at = version_info["standing_updated_timestamp"]
+
+            # No reliable promotion date (legacy record predating this field):
+            # skip rather than force-update off unknown data. The next standing
+            # change re-stamps standing_updated_timestamp and enforcement resumes.
+            if not promoted_at:
+                logger.warning(f"{platform}: no standing_updated_timestamp on target build "
+                               f"{version_info['sensor_version']} - skipping enforcement until "
+                               f"update-sensor-tracker re-stamps the promotion date")
+                platform_details.append({
+                    "platform": platform,
+                    "target_standing": version_info["target_standing"],
+                    "target_version": version_info["sensor_version"],
+                    "policy_name": version_info.get("policy_name", ""),
+                    "first_seen_timestamp": version_info["first_seen_timestamp"],
+                    "standing_updated_timestamp": 0,
+                    "grace_period_expired": False,
+                    "days_since_release": 0,
+                    "stale_hosts_found": 0,
+                    "hosts_added": 0,
+                })
+                continue
+
             elapsed = now - promoted_at
             days_since = round(elapsed / 86400, 1)
             expired = elapsed >= grace_seconds

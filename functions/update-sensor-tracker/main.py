@@ -86,7 +86,7 @@ def extract_error_message(response: Dict[str, Any]) -> str:
     """
     if not isinstance(response, dict):
         return "Unknown error"
-    errors = response.get("body", {}).get("errors", [])
+    errors = (response.get("body") or {}).get("errors", [])
     if isinstance(errors, list) and errors:
         msgs = [e.get("message", "") for e in errors
                 if isinstance(e, dict) and e.get("message")]
@@ -194,7 +194,7 @@ def update_sensor_tracker_handler(
                     code=sensor_response.get("status_code", 500),
                     errors=[
                         APIError(
-                            code=sensor_response["status_code"],
+                            code=sensor_response.get("status_code", 500),
                             message=f"Failed to fetch sensor builds for {platform}: {error_message}",
                         )
                     ],
