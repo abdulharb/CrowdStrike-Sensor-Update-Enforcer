@@ -76,6 +76,7 @@
                             "target_version": { "type": "string", "description": "Current sensor version at that standing" },
                             "policy_name": { "type": "string" },
                             "first_seen_timestamp": { "type": "integer" },
+                            "standing_updated_timestamp": { "type": "integer", "description": "When the target build was promoted to its standing; grace is measured from here" },
                             "grace_period_expired": { "type": "boolean" },
                             "days_since_release": { "type": "number" },
                             "stale_hosts_found": { "type": "integer" },
