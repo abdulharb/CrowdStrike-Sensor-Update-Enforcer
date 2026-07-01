@@ -107,8 +107,10 @@ The manifest deploys the UI's `dist/` output as-is, so build it first:
 cd "Sensor Update Enforcer/ui/pages/Sensor Release Tracker"
 pnpm install && pnpm build
 cd ../../..
-foundry apps deploy
+foundry apps deploy --change-type Patch --change-log "description of changes"
 ```
+
+`--change-type` and `--change-log` are required -- omitting them causes a 500 error.
 
 ### Step 6: Scheduled Workflow (automatic)
 
@@ -263,7 +265,7 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 - [ ] Force policy has **higher precedence** (lower number) than the source policy
 - [ ] `SOURCE_GROUP_ID` is set to the correct host group ID
 - [ ] `FORCE_UPDATE_GROUP_ID` is set to the correct host group ID
-- [ ] UI built (`pnpm build`) and app deployed with `foundry apps deploy`
+- [ ] UI built (`pnpm build`) and app deployed with `foundry apps deploy --change-type ... --change-log ...`
 - [ ] `update-sensor-tracker` has been run at least once (collection has data)
 - [ ] Dry run of `enforce-grace-period` returns expected results
 - [ ] The bundled scheduled workflow ("Sensor Update Enforcer - Scheduled") is active
