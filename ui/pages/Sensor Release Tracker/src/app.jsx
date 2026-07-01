@@ -5,7 +5,6 @@ import {
   FalconApiContext,
 } from "./contexts/falcon-api-context";
 import { Home } from "./routes/home";
-import { About } from "./routes/about";
 import ReactDOM from "react-dom/client";
 
 function App() {
@@ -20,7 +19,6 @@ function App() {
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/sensor-release-tracker" element={<Home />} />
-            <Route path="/about" element={<About />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </HashRouter>
