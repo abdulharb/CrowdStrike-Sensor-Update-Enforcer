@@ -14,7 +14,7 @@ from logging import Logger
 from typing import Dict, Any, List, Optional
 
 from crowdstrike.foundry.function import Function, Request, Response, APIError
-from falconpy import APIHarnessV2, SensorUpdatePolicies
+from falconpy import CustomStorage, SensorUpdatePolicies
 
 FUNC = Function.instance()
 
@@ -96,10 +96,9 @@ def extract_error_message(response: Dict[str, Any]) -> str:
 
 
 def read_existing_record(
-    api_client: APIHarnessV2,
+    storage: CustomStorage,
     collection_name: str,
     object_key: str,
-    headers: Dict[str, str],
     logger: Logger,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -107,11 +106,9 @@ def read_existing_record(
     """
     try:
         log_debug(logger, f"Reading record: {object_key}")
-        response = api_client.command(
-            "GetObject",
+        response = storage.GetObject(
             collection_name=collection_name,
             object_key=object_key,
-            headers=headers,
         )
 
         if isinstance(response, bytes):
@@ -176,8 +173,10 @@ def update_sensor_tracker_handler(
         logger.info(f"Querying platforms: {platforms}, stage: {stage}")
 
         falcon_sensor = SensorUpdatePolicies()
-        api_client = APIHarnessV2()
-        headers = get_headers()
+        # CustomStorage service class (not the Uber class): the Foundry
+        # functions editor auto-detects OAuth scopes from this import.
+        # ext_headers applies X-CS-APP-ID to every request.
+        storage = CustomStorage(ext_headers=get_headers())
 
         # Fetch sensor builds from API
         resources = []
@@ -263,7 +262,7 @@ def update_sensor_tracker_handler(
 
                 # Read existing record
                 existing = read_existing_record(
-                    api_client, COLLECTION_NAME, object_key, headers, logger
+                    storage, COLLECTION_NAME, object_key, logger
                 )
 
                 if existing is not None:
@@ -309,12 +308,10 @@ def update_sensor_tracker_handler(
                     existing["standing_updated_timestamp"] = current_timestamp
                     # Keep original first_seen_timestamp and sensor_version
 
-                    put_response = api_client.command(
-                        "PutObject",
+                    put_response = storage.PutObject(
                         body=existing,
                         collection_name=COLLECTION_NAME,
                         object_key=object_key,
-                        headers=headers,
                     )
 
                     if isinstance(put_response, bytes) or put_response.get("status_code") == 200:
@@ -344,12 +341,10 @@ def update_sensor_tracker_handler(
                         "previous_standings": [],
                     }
 
-                    put_response = api_client.command(
-                        "PutObject",
+                    put_response = storage.PutObject(
                         body=collection_entry,
                         collection_name=COLLECTION_NAME,
                         object_key=object_key,
-                        headers=headers,
                     )
 
                     if isinstance(put_response, bytes) or put_response.get("status_code") == 200:
