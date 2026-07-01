@@ -5,7 +5,7 @@
 
 A [CrowdStrike Falcon Foundry](https://www.crowdstrike.com/en-us/platform/next-gen-siem/falcon-foundry/) app that ensures hosts stay up-to-date with their sensor update policy, even when they're only online during blackout windows.
 
-Built with Falcon Foundry Functions (Python) and Foundry Collections for state management. Runs as scheduled Foundry workflows -- no external infrastructure required.
+Built with Falcon Foundry Functions (Python) and Foundry Collections for state management. A bundled Foundry workflow runs everything on a schedule, and a **Sensor Release Tracker** UI page (the app's homepage in the Falcon console) shows release standings and update history -- no external infrastructure required.
 
 ## The Problem
 
@@ -28,7 +28,7 @@ flowchart LR
 
 ## How It Works
 
-Two Foundry Functions run on a scheduled workflow (recommended: every 4-6 hours):
+Two Foundry Functions run on a bundled scheduled workflow (every 4 hours):
 
 ### 1. update-sensor-tracker
 
@@ -41,6 +41,10 @@ Reads the source host group's sensor update policy to determine the target stand
 **Phase A - Cleanup (always runs):** Checks hosts in the force update group. If a host's sensor version now meets the source policy's target, it gets removed from the force group -- back to the normal maintenance-window-only policy.
 
 **Phase B - Enforcement (after grace period):** Looks up when the current build at the target standing first appeared in the collection. If the grace period has expired, finds hosts in the source group that are still behind and adds them to the force update group in batches.
+
+### Sensor Release Tracker UI
+
+The app also includes a **Sensor Release Tracker** page (set as the app homepage in the Falcon console, with a nav link) that visualizes the collection: current builds per release standing, per platform, and when each version first appeared. See its own [README](ui/pages/Sensor%20Release%20Tracker/README.md) for development details.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed flow diagram.
 
@@ -75,7 +79,7 @@ You need two CrowdStrike sensor update policies and two host groups. If you alre
 
 ### Step 4: Configure Environment Variables
 
-In `manifest.yml`, set the environment variables under the `enforce-grace-period` function:
+In `manifest.yml`, set the environment variables under the `enforce-grace-period` function. **The committed manifest contains values from my dev environment (including group IDs and `DEBUG_MODE: "true"`) -- replace them with your own:**
 
 ```yaml
 environment_variables:
@@ -90,32 +94,31 @@ environment_variables:
 |----------|----------|---------|-------------|
 | `SOURCE_GROUP_ID` | Yes | | Host group ID with the maintenance-window policy |
 | `FORCE_UPDATE_GROUP_ID` | Yes | | Host group ID with the force-update policy (no blackout) |
-| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates |
+| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates (0-90) |
 | `PLATFORMS` | No | `windows` | Comma-separated platforms to enforce: `windows`, `mac`, `linux` |
+| `TARGET_STANDING` | No | | Override the standing detected from the source policy (e.g., `n-2`). Needed when the source policy's build string is untagged |
 | `DEBUG_MODE` | No | `false` | Enable verbose debug logging |
 
-### Step 5: Deploy
+### Step 5: Build the UI and Deploy
+
+The manifest deploys the UI's `dist/` output as-is, so build it first:
 
 ```bash
-cd "Sensor Update Enforcer"
+cd "Sensor Update Enforcer/ui/pages/Sensor Release Tracker"
+pnpm install && pnpm build
+cd ../../..
 foundry apps deploy
 ```
 
-### Step 6: Create Scheduled Workflows
+### Step 6: Scheduled Workflow (automatic)
 
-After deploying, create two scheduled Foundry workflows:
+The app bundles a scheduled workflow (`workflows/workflow.yml`) that provisions on install -- no manual workflow setup needed. Every 4 hours it:
 
-**Workflow 1 -- Track Sensor Releases:**
-- Trigger: Schedule (every 4-6 hours)
-- Action: `update-sensor-tracker`
-- Body: `{"platforms": ["windows"]}` (add `"mac"`, `"linux"` as needed)
+1. Runs `update-sensor-tracker` for all platforms (`windows`, `mac`, `linux`)
+2. Sleeps 10 minutes
+3. Runs `enforce-grace-period` (uses the env var config)
 
-**Workflow 2 -- Enforce Grace Period:**
-- Trigger: Schedule (every 4-6 hours, offset from Workflow 1)
-- Action: `enforce-grace-period`
-- Body: `{}` (uses env var defaults)
-
-Run Workflow 1 at least once before Workflow 2 so the collection has version data to work with.
+The schedule's timezone is `America/Los_Angeles`; edit `workflows/workflow.yml` before deploying if you want a different cadence or timezone.
 
 ### Step 7: Verify with Dry Run
 
@@ -145,7 +148,7 @@ POST /enforce-grace-period
 
 ### Override Grace Period
 
-Setting `grace_period_days` to `0` triggers immediate enforcement -- useful for testing:
+Accepts `0`-`90`. Setting `grace_period_days` to `0` triggers immediate enforcement -- useful for testing:
 
 ```json
 POST /enforce-grace-period
@@ -171,6 +174,8 @@ POST /update-sensor-tracker
     "platforms": ["windows", "mac", "linux"]
 }
 ```
+
+`update-sensor-tracker` also accepts an optional `stage` parameter (default `"prod"`) to query a different sensor build stage.
 
 ---
 
@@ -258,10 +263,10 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 - [ ] Force policy has **higher precedence** (lower number) than the source policy
 - [ ] `SOURCE_GROUP_ID` is set to the correct host group ID
 - [ ] `FORCE_UPDATE_GROUP_ID` is set to the correct host group ID
-- [ ] App deployed with `foundry apps deploy`
+- [ ] UI built (`pnpm build`) and app deployed with `foundry apps deploy`
 - [ ] `update-sensor-tracker` has been run at least once (collection has data)
 - [ ] Dry run of `enforce-grace-period` returns expected results
-- [ ] Both scheduled workflows are created and active
+- [ ] The bundled scheduled workflow ("Sensor Update Enforcer - Scheduled") is active
 
 ---
 
@@ -269,7 +274,7 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 
 **Phase B never runs / "No version found in collection"**
 - Run `update-sensor-tracker` first to populate the collection
-- Verify the source group's policy has a tagged build string (not untagged)
+- Verify the source group's policy has a tagged build string (not untagged) -- or set the `TARGET_STANDING` env var to specify the standing manually
 
 **Hosts aren't being added to the force group**
 - Check that `GRACE_PERIOD_DAYS` has elapsed since the version first appeared
@@ -297,15 +302,22 @@ Sensor Update Enforcer/
 ├── ARCHITECTURE.md                        # Detailed flow diagram (Mermaid)
 ├── collections/
 │   └── sensor_release_tracker.json        # Foundry Collection schema
-└── functions/
-    ├── update-sensor-tracker/             # Foundry Function: version tracking
-    │   ├── main.py
-    │   ├── requirements.txt
-    │   ├── request_schema.json
-    │   └── response_schema.json
-    └── enforce-grace-period/              # Foundry Function: grace period enforcement
-        ├── main.py
-        ├── requirements.txt
-        ├── request_schema.json
-        └── response_schema.json
+├── functions/
+│   ├── update-sensor-tracker/             # Foundry Function: version tracking
+│   │   ├── main.py
+│   │   ├── test_main.py
+│   │   ├── requirements.txt
+│   │   ├── request_schema.json
+│   │   └── response_schema.json
+│   └── enforce-grace-period/              # Foundry Function: grace period enforcement
+│       ├── main.py
+│       ├── test_main.py
+│       ├── requirements.txt
+│       ├── request_schema.json
+│       └── response_schema.json
+├── ui/
+│   └── pages/
+│       └── Sensor Release Tracker/        # UI page: release standings dashboard (React + Vite)
+└── workflows/
+    └── workflow.yml                       # Bundled scheduled workflow (provisions on install)
 ```
