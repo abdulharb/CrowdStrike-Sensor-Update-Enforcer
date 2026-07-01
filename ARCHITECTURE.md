@@ -4,18 +4,18 @@
 
 This Falcon Foundry app ensures hosts stay up-to-date with the sensor version targeted by their source host group's policy, even if they're only online during business hours when updates are blacked out.
 
-The app is built entirely on Foundry primitives: **Foundry Functions** (Python) for the logic, a **Foundry Collection** for persistent state, and **Foundry Workflows** for scheduling. No external infrastructure is required.
+The app is built entirely on Foundry primitives: **Foundry Functions** (Python) for the logic, a **Foundry Collection** for persistent state, a bundled **Foundry Workflow** for scheduling, and a **Foundry UI Page** (React + Vite, the app homepage) that visualizes the collection as a release-standings dashboard. No external infrastructure is required.
 
 ## Architecture Diagram
 
 ```mermaid
 flowchart TD
-    subgraph Trigger["Scheduled Foundry Workflow (e.g. every 4-6 hours)"]
-        CRON["Schedule Trigger"]
+    subgraph Trigger["Bundled Foundry Workflow (every 4 hours, provisions on install)"]
+        CRON["Schedule Trigger"] --> SLEEP["update-sensor-tracker,<br/>then sleep 10 minutes,<br/>then enforce-grace-period"]
     end
 
     CRON --> F1
-    CRON --> F2
+    SLEEP --> F2
 
     subgraph F1["Foundry Function: update-sensor-tracker"]
         F1_START["POST /update-sensor-tracker"] --> F1_FETCH["Fetch sensor builds per platform<br/>SensorUpdatePolicies.query_combined_builds()"]
@@ -33,7 +33,7 @@ flowchart TD
     end
 
     subgraph F2["Foundry Function: enforce-grace-period"]
-        F2_START["POST /enforce-grace-period"] --> F2_CONFIG["Load config from env vars<br/>SOURCE_GROUP_ID<br/>FORCE_UPDATE_GROUP_ID<br/>GRACE_PERIOD_DAYS<br/>PLATFORMS"]
+        F2_START["POST /enforce-grace-period"] --> F2_CONFIG["Load config from env vars<br/>SOURCE_GROUP_ID<br/>FORCE_UPDATE_GROUP_ID<br/>GRACE_PERIOD_DAYS<br/>PLATFORMS<br/>TARGET_STANDING (optional)"]
 
         F2_CONFIG --> F2_POLICY["Query source group's sensor update policy<br/>SensorUpdatePolicies.query_combined_policies_v2()<br/>Find policy attached to SOURCE_GROUP_ID"]
 
@@ -115,7 +115,8 @@ flowchart TD
 | `update-sensor-tracker` | Foundry Function (Python) | Polls sensor builds API, tracks version standings in collection |
 | `enforce-grace-period` | Foundry Function (Python) | Manages force-group membership based on grace period |
 | `sensor_release_tracker` | Foundry Collection | Stores version records with `first_seen_timestamp` for grace period math |
-| Scheduled workflows | Foundry Workflow | Triggers both functions on a recurring schedule |
+| Sensor Update Enforcer - Scheduled | Foundry Workflow (bundled, provisions on install) | Every 4 hours: tracker, 10-minute sleep, then enforcement |
+| Sensor Release Tracker | Foundry UI Page (React + Vite) | App homepage; dashboard of release standings and update history from the collection |
 
 ## Environment Variables
 
@@ -123,8 +124,9 @@ flowchart TD
 |----------|----------|---------|-------------|
 | `SOURCE_GROUP_ID` | Yes | | Host group ID with the normal maintenance-window policy |
 | `FORCE_UPDATE_GROUP_ID` | Yes | | Host group ID with the force-update (no blackout) policy |
-| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates |
+| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates (0-90) |
 | `PLATFORMS` | No | `windows` | Comma-separated platforms to enforce |
+| `TARGET_STANDING` | No | | Override the standing detected from the source policy (e.g., `n-2`); needed when the policy's build string is untagged |
 | `DEBUG_MODE` | No | `false` | Enable verbose debug logging |
 
 ## Prerequisites
