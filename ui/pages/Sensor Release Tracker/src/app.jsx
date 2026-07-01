@@ -6,11 +6,18 @@ import {
 } from "./contexts/falcon-api-context";
 import { Home } from "./routes/home";
 import ReactDOM from "react-dom/client";
+import "@shoelace-style/shoelace/dist/components/spinner/spinner.js";
 
 function App() {
   const { falcon, navigation, isInitialized } = useFalconApiContext();
 
-  if (!isInitialized) return null;
+  if (!isInitialized) {
+    return (
+      <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh" }}>
+        <sl-spinner style={{ fontSize: "2.5rem" }} />
+      </div>
+    );
+  }
 
   return (
     <React.StrictMode>
