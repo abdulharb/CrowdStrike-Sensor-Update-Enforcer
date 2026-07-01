@@ -29,26 +29,23 @@ LOGGER = logging.getLogger("test")
 # ---------------------------------------------------------------------------
 
 class FakeStore:
-    """In-memory stand-in for APIHarnessV2 custom-storage commands."""
+    """In-memory stand-in for the CustomStorage service class."""
 
     def __init__(self, initial=None):
         # object_key -> record dict
         self.objects = {k: _copy(v) for k, v in (initial or {}).items()}
         self.put_keys = []  # order of PutObject calls
 
-    def command(self, op, **kwargs):
-        if op == "GetObject":
-            key = kwargs["object_key"]
-            if key in self.objects:
-                # Storage returns a fresh copy each read.
-                return {"status_code": 200, "body": _copy(self.objects[key])}
-            return {"status_code": 404}
-        if op == "PutObject":
-            key = kwargs["object_key"]
-            self.objects[key] = _copy(kwargs["body"])
-            self.put_keys.append(key)
-            return {"status_code": 200}
-        raise AssertionError(f"unexpected command op: {op}")
+    def GetObject(self, collection_name=None, object_key=None, **kwargs):
+        if object_key in self.objects:
+            # Storage returns a fresh copy each read.
+            return {"status_code": 200, "body": _copy(self.objects[object_key])}
+        return {"status_code": 404}
+
+    def PutObject(self, collection_name=None, object_key=None, body=None, **kwargs):
+        self.objects[object_key] = _copy(body)
+        self.put_keys.append(object_key)
+        return {"status_code": 200}
 
 
 class FakeSensor:
@@ -96,7 +93,7 @@ def record(build_number, standing, platform="Linux", prev=None, updated=1000, fi
 def run_handler(monkeypatch, builds_by_platform, initial_store=None, platforms=None):
     monkeypatch.delenv("DEBUG_MODE", raising=False)
     store = FakeStore(initial_store)
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: store)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k:store)
     monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: FakeSensor(builds_by_platform))
     req = Request(
         method="POST",
@@ -311,10 +308,8 @@ class FakeSensorStatus:
 class FakeStoreBadPut(FakeStore):
     """GetObject works; PutObject always fails with 500."""
 
-    def command(self, op, **kwargs):
-        if op == "PutObject":
-            return {"status_code": 500}
-        return super().command(op, **kwargs)
+    def PutObject(self, **kwargs):
+        return {"status_code": 500}
 
 
 class StoreBytesGet:
@@ -323,21 +318,21 @@ class StoreBytesGet:
     def __init__(self, rec):
         self.rec = rec
 
-    def command(self, op, **kwargs):
+    def GetObject(self, **kwargs):
         return json.dumps(self.rec).encode("utf-8")
 
 
 class StoreGet200NoRecord:
     """A 200 whose body is NOT the stored record (e.g. a wrapped resources list)."""
 
-    def command(self, op, **kwargs):
+    def GetObject(self, **kwargs):
         return {"status_code": 200, "body": {"resources": []}}
 
 
 def test_api_failure_returns_error_response(monkeypatch):
     monkeypatch.delenv("DEBUG_MODE", raising=False)
     store = FakeStore()
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: store)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k:store)
     monkeypatch.setattr(
         main, "SensorUpdatePolicies",
         lambda *a, **k: FakeSensorStatus(500, {"errors": [{"message": "rate limited"}]}),
@@ -356,7 +351,7 @@ def test_api_failure_returns_error_response(monkeypatch):
 def test_put_failure_records_error_and_207(monkeypatch):
     monkeypatch.delenv("DEBUG_MODE", raising=False)
     store = FakeStoreBadPut()
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: store)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k:store)
     monkeypatch.setattr(main, "SensorUpdatePolicies",
                         lambda *a, **k: FakeSensor({"linux": [api_build("7.36.18909", "18909|n-2|tagged|6")]}))
     req = Request(method="POST", url="/update-sensor-tracker",
@@ -371,7 +366,7 @@ def test_put_failure_records_error_and_207(monkeypatch):
 def test_read_existing_record_bytes_path():
     rec = record("18909", "n-2")
     out = main.read_existing_record(StoreBytesGet(rec), main.COLLECTION_NAME,
-                                    "linux_18909", {}, LOGGER)
+                                    "linux_18909", LOGGER)
     assert out is not None
     assert out["release_standing"] == "n-2"
 
@@ -381,7 +376,7 @@ def test_read_existing_record_200_without_record_returns_none():
     # caller treats the build as NEW and resets first_seen_timestamp -- which
     # silently restarts the enforce grace clock every run.
     out = main.read_existing_record(StoreGet200NoRecord(), main.COLLECTION_NAME,
-                                    "linux_18909", {}, LOGGER)
+                                    "linux_18909", LOGGER)
     assert out is None
 
 
@@ -393,7 +388,7 @@ def test_invalid_platform_returns_400(monkeypatch):
 
 def test_empty_platforms_returns_400(monkeypatch):
     monkeypatch.delenv("DEBUG_MODE", raising=False)
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: FakeStore())
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k:FakeStore())
     monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: FakeSensor({}))
     req = Request(method="POST", url="/update-sensor-tracker", body={"platforms": []})
     resp = main.FUNC._router.route(req, logger=LOGGER)
@@ -439,7 +434,7 @@ def test_build_fetch_error_without_status_code_surfaces_real_message(monkeypatch
         def query_combined_builds(self, platform, stage):
             return {"body": {"errors": [{"code": 503, "message": "upstream unavailable"}]}}
     monkeypatch.delenv("DEBUG_MODE", raising=False)
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: FakeStore())
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k:FakeStore())
     monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: SensorNoStatus())
     req = Request(method="POST", url="/update-sensor-tracker",
                   body={"platforms": ["linux"], "stage": "prod"})

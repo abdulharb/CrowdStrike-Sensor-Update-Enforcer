@@ -93,21 +93,22 @@ class FakeHostGroup:
 
 
 class FakeStore:
-    """Stand-in for APIHarnessV2 (collection SearchObjects/GetObject)."""
+    """Stand-in for CustomStorage (collection SearchObjects/GetObject)."""
 
     def __init__(self, by_platform_standing=None):
         # {(platform_fql, standing): record}
         self.data = by_platform_standing or {}
 
-    def command(self, op, **kwargs):
-        if op == "SearchObjects":
-            flt = kwargs.get("filter", "")
-            # filter form: platform:'Windows'+release_standing:'n-2'
-            plat = flt.split("platform:")[1].split("+")[0].strip("'")
-            standing = flt.split("release_standing:")[1].strip("'")
-            rec = self.data.get((plat, standing))
-            return _resp([rec] if rec else [])
-        raise AssertionError(f"unexpected store op: {op}")
+    def SearchObjects(self, collection_name=None, filter="", **kwargs):
+        # filter form: platform:'Windows'+release_standing:'n-2'
+        plat = filter.split("platform:")[1].split("+")[0].strip("'")
+        standing = filter.split("release_standing:")[1].strip("'")
+        rec = self.data.get((plat, standing))
+        return _resp([rec] if rec else [])
+
+    def GetObject(self, **kwargs):
+        raise AssertionError("GetObject fallback should not be needed: "
+                             "FakeStore records carry the full body")
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +231,17 @@ def test_source_policy_target_standing_override():
     assert targets["windows"]["target_standing"] == "n-1"
 
 
+def test_source_policy_untagged_does_not_replace_valid_target():
+    # A pinned (untagged) policy with better precedence must not clobber an
+    # already-found valid target -- and must not log a bogus "Replacing".
+    pinned = policy("Pinned", build="20505", sensor_version="7.33.20505")
+    pinned["precedence"] = 1
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",)), pinned])
+    targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
+    assert targets["windows"]["policy_name"] == "Force Update"
+    assert targets["windows"]["target_standing"] == "n-2"
+
+
 def test_source_policy_disabled_policy_currently_still_used():
     # BEHAVIOR: the code does NOT filter enabled=False. CrowdStrike ignores
     # disabled policies; this documents the current divergence.
@@ -270,6 +282,14 @@ def test_cleanup_empty_agent_version_is_kept():
     members = [device("d1", "")]
     out = main.find_hosts_to_cleanup(members, _targets(), LOGGER)
     assert out == []
+
+
+def test_cleanup_unparseable_target_skips_platform():
+    # Empty/garbage target -> (0,0,0) -> every host would look "current" and
+    # the whole force group would be emptied. Guard skips the platform instead.
+    members = [device("d1", "7.30.20000"), device("d2", "7.36.20805")]
+    assert main.find_hosts_to_cleanup(members, _targets(""), LOGGER) == []
+    assert main.find_hosts_to_cleanup(members, _targets("garbage"), LOGGER) == []
 
 
 # ===========================================================================
@@ -358,7 +378,7 @@ def _route(monkeypatch, *, sensor, hg, store, body, env):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: sensor)
     monkeypatch.setattr(main, "HostGroup", lambda *a, **k: hg)
-    monkeypatch.setattr(main, "APIHarnessV2", lambda *a, **k: store)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k: store)
     req = Request(method="POST", url="/enforce-grace-period", body=body)
     return main.FUNC._router.route(req, logger=LOGGER)
 
@@ -378,6 +398,13 @@ def test_handler_missing_source_group_returns_400(monkeypatch):
     resp = _route(monkeypatch, sensor=FakeSensor([]), hg=FakeHostGroup(),
                   store=FakeStore(), body={}, env=env)
     assert resp.code == 400
+
+
+def test_handler_grace_period_out_of_range_returns_400(monkeypatch):
+    for bad in (-1, 91):
+        resp = _route(monkeypatch, sensor=FakeSensor([]), hg=FakeHostGroup(),
+                      store=FakeStore(), body={"grace_period_days": bad}, env=BASE_ENV)
+        assert resp.code == 400, f"grace_period_days={bad} should be rejected"
 
 
 def test_handler_no_policy_on_source_returns_400(monkeypatch):

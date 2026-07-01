@@ -20,7 +20,7 @@ from logging import Logger
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from crowdstrike.foundry.function import Function, Request, Response, APIError
-from falconpy import APIHarnessV2, HostGroup, SensorUpdatePolicies
+from falconpy import CustomStorage, HostGroup, SensorUpdatePolicies
 
 FUNC = Function.instance()
 
@@ -138,6 +138,17 @@ def load_config(body: Dict[str, Any], logger: Logger) -> Tuple[Optional[Dict[str
                     message="grace_period_days must be a number (0-90)"
                 )]
             )
+
+    # Covers both the env default and the body override. Negative grace would
+    # mean "enforce immediately", which is never intended.
+    if not 0 <= grace_period_days <= 90:
+        return None, Response(
+            code=400,
+            errors=[APIError(
+                code=400,
+                message=f"grace_period_days must be between 0 and 90 (got {grace_period_days})"
+            )]
+        )
 
     # Platforms: env var default, request body override
     platforms = [p.strip() for p in os.environ.get("PLATFORMS", "windows").split(",") if p.strip()]
@@ -286,22 +297,6 @@ def get_source_policy_targets(
         policy_name = policy.get("name", "")
         precedence = policy.get("precedence", 9999)
 
-        # If we already have a match for this platform, keep the higher-precedence
-        # one (lower number = higher priority, matching CrowdStrike evaluation order)
-        if platform_key in targets:
-            existing_precedence = targets[platform_key].get("precedence", 9999)
-            if precedence >= existing_precedence:
-                log_debug(logger, f"{platform_key}: Skipping policy '{policy_name}' "
-                          f"(precedence {precedence}) - already have higher-precedence "
-                          f"policy '{targets[platform_key]['policy_name']}' "
-                          f"(precedence {existing_precedence})")
-                continue
-            else:
-                logger.info(f"{platform_key}: Replacing policy "
-                            f"'{targets[platform_key]['policy_name']}' "
-                            f"(precedence {existing_precedence}) with "
-                            f"'{policy_name}' (precedence {precedence})")
-
         settings = policy.get("settings", {})
         build_str = settings.get("build", "")
         sensor_version = settings.get("sensor_version", "")
@@ -316,11 +311,35 @@ def get_source_policy_targets(
             log_debug(logger, f"{platform_key}: Parsed build string '{build_str}' -> "
                       f"standing='{standing}'")
 
+        # Validate BEFORE the precedence decision so an untagged/pinned policy
+        # never logs "Replacing" and then silently keeps the old target.
         if not standing or standing == "untagged":
+            kept = ""
+            if platform_key in targets:
+                kept = (f" Keeping existing target from policy "
+                        f"'{targets[platform_key]['policy_name']}'.")
             logger.warning(f"{platform_key}: Could not determine target standing from "
                            f"policy '{policy_name}' (build='{build_str}'). "
-                           f"Set TARGET_STANDING env var to override.")
+                           f"Set TARGET_STANDING env var to override.{kept}")
             continue
+
+        # If we already have a match for this platform, keep the higher-precedence
+        # one (lower number = higher priority, matching CrowdStrike evaluation
+        # order). Note: the live API omits 'precedence', so in practice both
+        # default to 9999 and the first policy returned wins.
+        if platform_key in targets:
+            existing_precedence = targets[platform_key].get("precedence", 9999)
+            if precedence >= existing_precedence:
+                log_debug(logger, f"{platform_key}: Skipping policy '{policy_name}' "
+                          f"(precedence {precedence}) - already have higher-precedence "
+                          f"policy '{targets[platform_key]['policy_name']}' "
+                          f"(precedence {existing_precedence})")
+                continue
+            else:
+                logger.info(f"{platform_key}: Replacing policy "
+                            f"'{targets[platform_key]['policy_name']}' "
+                            f"(precedence {existing_precedence}) with "
+                            f"'{policy_name}' (precedence {precedence})")
 
         targets[platform_key] = {
             "policy_id": policy.get("id", ""),
@@ -346,9 +365,8 @@ def get_source_policy_targets(
 # ---------------------------------------------------------------------------
 
 def get_target_versions(
-    api_client: APIHarnessV2,
+    storage: CustomStorage,
     policy_targets: Dict[str, Dict[str, Any]],
-    headers: Dict[str, str],
     logger: Logger
 ) -> Dict[str, Dict[str, Any]]:
     """
@@ -368,13 +386,11 @@ def get_target_versions(
         # Use PLATFORM_FQL_MAP to match the stored value.
         platform_fql = PLATFORM_FQL_MAP.get(platform, platform)
 
-        resp = api_client.command(
-            "SearchObjects",
+        resp = storage.SearchObjects(
             filter=f"platform:'{platform_fql}'+release_standing:'{standing}'",
             sort="first_seen_timestamp|desc",
             collection_name=COLLECTION_NAME,
             limit=1,
-            headers=headers
         )
 
         if resp.get("status_code") == 200:
@@ -388,11 +404,9 @@ def get_target_versions(
                 if "sensor_version" not in entry and "object_key" in entry:
                     log_debug(logger, f"SearchObjects returned key only — "
                               f"fetching full record: {entry['object_key']}")
-                    get_resp = api_client.command(
-                        "GetObject",
+                    get_resp = storage.GetObject(
                         collection_name=COLLECTION_NAME,
                         object_key=entry["object_key"],
-                        headers=headers,
                     )
                     if isinstance(get_resp, bytes):
                         entry = json.loads(get_resp.decode("utf-8"))
@@ -474,6 +488,18 @@ def find_hosts_to_cleanup(
     logger: Logger
 ) -> List[Dict[str, Any]]:
     """Identify force-group members whose sensor version now meets the source policy target."""
+    # An unparseable target ((0,0,0)) would make every host "current" and empty
+    # the force group in one run. Skip cleanup for that platform instead.
+    usable = {}
+    for platform_key, info in target_versions.items():
+        if parse_version(info.get("sensor_version", "")) == (0, 0, 0):
+            logger.warning(f"{platform_key}: target version "
+                           f"{info.get('sensor_version', '')!r} is unparseable - "
+                           f"skipping cleanup for this platform")
+        else:
+            usable[platform_key] = info
+    target_versions = usable
+
     to_remove = []
     for device in members:
         platform_name = device.get("platform_name", "")
@@ -658,10 +684,12 @@ def enforce_grace_period_handler(
         dry_run = cfg["dry_run"]
 
         # --- Init clients ---
-        api_client = APIHarnessV2()
+        # CustomStorage service class (not the Uber class): the Foundry
+        # functions editor auto-detects OAuth scopes from this import.
+        # ext_headers applies X-CS-APP-ID to every request.
+        storage = CustomStorage(ext_headers=get_headers())
         falcon_hg = HostGroup()
         falcon_sensor = SensorUpdatePolicies()
-        headers = get_headers()
 
         # --- Detect source policy targets ---
         policy_targets = get_source_policy_targets(
@@ -682,7 +710,7 @@ def enforce_grace_period_handler(
         policy_targets = {k: v for k, v in policy_targets.items() if k in platforms}
 
         # --- Look up current builds at the target standings from collection ---
-        target_versions = get_target_versions(api_client, policy_targets, headers, logger)
+        target_versions = get_target_versions(storage, policy_targets, logger)
 
         # Build cleanup targets: prefer collection data, fall back to policy's
         # own sensor_version so Phase A can always run even if the collection
