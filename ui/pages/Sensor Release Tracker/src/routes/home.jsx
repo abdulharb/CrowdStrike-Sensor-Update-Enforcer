@@ -187,6 +187,7 @@ function FilterPills({ label, options, value, onChange }) {
           <button
             key={opt.value}
             onClick={() => onChange(opt.value)}
+            aria-pressed={value === opt.value}
             className={`focusable rounded px-2.5 py-1.5 text-xs font-medium transition-colors ${
               value === opt.value ? 'interactive-primary' : 'interactive-quiet'
             }`}
@@ -196,6 +197,29 @@ function FilterPills({ label, options, value, onChange }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function SortableTh({ colKey, label, sortConfig, onSort, className, align }) {
+  const active = sortConfig.key === colKey;
+  return (
+    <th
+      className={className}
+      onClick={() => onSort(colKey)}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSort(colKey);
+        }
+      }}
+      aria-sort={active ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+    >
+      <span className={`inline-flex items-center gap-1${align === 'right' ? ' justify-end' : ''}`}>
+        {label}
+        <IconSort size={9} direction={active ? sortConfig.direction : null} className="ml-0.5" />
+      </span>
+    </th>
   );
 }
 
@@ -219,6 +243,8 @@ function Home() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const [loadWarning, setLoadWarning] = useState(null);
+  const [usingMockData, setUsingMockData] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [exportStatus, setExportStatus] = useState('idle');
 
@@ -249,18 +275,23 @@ function Home() {
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       setError(null);
+      setLoadWarning(null);
 
       if (!falcon.isConnected) {
         console.log('Falcon not connected — using mock data for preview.');
+        setUsingMockData(true);
         setData(MOCK_DATA);
         setLastUpdated(new Date());
         return;
       }
+      setUsingMockData(false);
 
       const col = falcon.collection({ collection: 'sensor_release_tracker' });
       const keysRes = await col.list({ limit: 500 });
+      if (keysRes?.errors?.length) {
+        throw new Error(keysRes.errors[0]?.message || 'Collection list failed');
+      }
       const keys = keysRes.resources || [];
-      if (keys.length >= 500) console.warn('Collection may have more than 500 records — only first 500 shown.');
 
       if (keys.length === 0) {
         setData([]);
@@ -268,14 +299,27 @@ function Home() {
         return;
       }
 
-      const records = await Promise.all(
-        keys.map(async (key) => {
-          try { return await col.read(key); }
-          catch (e) { console.warn(`Read failed for ${key}:`, e); return null; }
-        })
-      );
+      // Read in small batches — a flat Promise.all over hundreds of keys
+      // trips the collection API rate limit and drops rows silently.
+      const records = [];
+      for (let i = 0; i < keys.length; i += 8) {
+        const chunk = await Promise.all(
+          keys.slice(i, i + 8).map(async (key) => {
+            try { return await col.read(key); }
+            catch (e) { console.warn(`Read failed for ${key}:`, e); return null; }
+          })
+        );
+        records.push(...chunk);
+      }
 
-      setData(records.filter(Boolean));
+      const valid = records.filter((r) => r && r.sensor_version);
+      const failedCount = keys.length - valid.length;
+      const warnings = [];
+      if (failedCount > 0) warnings.push(`${failedCount} of ${keys.length} records failed to load`);
+      if (keys.length >= 500) warnings.push('showing first 500 records — collection may contain more');
+      setLoadWarning(warnings.length ? warnings.join('; ') : null);
+
+      setData(valid);
       setLastUpdated(new Date());
     } catch (err) {
       console.error('Collection fetch error:', err);
@@ -296,15 +340,25 @@ function Home() {
   const exportJson = useCallback(async () => {
     const json = JSON.stringify(data, null, 2);
 
+    let ok = false;
     try {
       await navigator.clipboard.writeText(json);
-      setExportStatus('copied');
-      setTimeout(() => setExportStatus('idle'), 3000);
-    } catch (e) {
-      console.error('Clipboard write failed:', e);
-      setExportStatus('failed');
-      setTimeout(() => setExportStatus('idle'), 3000);
+      ok = true;
+    } catch {
+      // Clipboard API is often blocked in sandboxed cross-origin iframes —
+      // fall back to the legacy execCommand path, which is not.
+      const ta = document.createElement('textarea');
+      ta.value = json;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      ta.remove();
     }
+
+    setExportStatus(ok ? 'copied' : 'failed');
+    setTimeout(() => setExportStatus('idle'), 3000);
   }, [data]);
 
   // ── Sort handler ───────────────────────────────────────
@@ -389,21 +443,15 @@ function Home() {
   // ── Render helpers ─────────────────────────────────────
   const thBase = 'sticky top-0 z-10 bg-surface-inner py-3 px-5 font-medium text-body-and-labels uppercase tracking-wider text-xs cursor-pointer select-none hover:text-titles-and-attributes transition-colors border-b border-lines-dark';
 
-  const sortIndicator = (key) => (
-    <IconSort
-      size={9}
-      direction={sortConfig.key === key ? sortConfig.direction : null}
-      className="ml-0.5"
-    />
-  );
-
   // ── Render ─────────────────────────────────────────────
   return (
     <div className="min-h-screen p-6 text-text-and-icons">
       <div className="max-w-7xl mx-auto space-y-5">
 
         {/* ── Header ── */}
-        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        {/* flex-wrap instead of sm: variants — Toucan's prebuilt CSS has no
+            responsive prefixes, so sm:/md: classes silently no-op. */}
+        <header className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h1 className="type-xl text-text-and-icons">Sensor Release Tracker</h1>
             <p className="type-sm text-body-and-labels mt-0.5">
@@ -438,9 +486,17 @@ function Home() {
           </div>
         </header>
 
+        {/* ── Preview-mode banner — never let sample data pass as live ── */}
+        {usingMockData && !loading && (
+          <div className="inline-flex items-center gap-2 px-3 py-2 rounded border badge-medium type-xs font-medium" role="status">
+            <IconWarning size={14} />
+            Preview mode — showing sample data. Open this page inside the Falcon console to see live records.
+          </div>
+        )}
+
         {/* ── Content area ── */}
         {loading ? (
-          <div className="flex flex-col justify-center items-center min-h-[40vh] gap-4">
+          <div className="flex flex-col justify-center items-center gap-4" style={{ minHeight: '40vh' }}>
             <SlSpinner style={{ fontSize: '3rem', '--track-width': '5px', color: 'var(--primary-idle)' }} />
             <p className="type-sm text-body-and-labels">Loading sensor data…</p>
           </div>
@@ -482,7 +538,12 @@ function Home() {
                     role="button"
                     tabIndex={0}
                     aria-pressed={isActive}
-                    onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setPlatformFilter(isActive ? 'all' : key)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault(); // Space would scroll the page otherwise
+                        setPlatformFilter(isActive ? 'all' : key);
+                      }
+                    }}
                   >
                     {/* Header: platform · build count */}
                     <div className="flex items-baseline gap-2 mb-3 min-w-0">
@@ -573,7 +634,7 @@ function Home() {
                 />
 
                 {/* Search */}
-                <div className="flex-1 min-w-[180px]">
+                <div className="flex-1" style={{ minWidth: '180px' }}>
                   <div className="relative">
                     <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-disabled pointer-events-none">
                       <IconSearch />
@@ -581,6 +642,7 @@ function Home() {
                     <input
                       type="text"
                       placeholder="Search versions, builds…"
+                      aria-label="Search versions, builds, and platforms"
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                       className="textbox type-sm w-full"
@@ -589,6 +651,7 @@ function Home() {
                     {search && (
                       <button
                         onClick={() => setSearch('')}
+                        aria-label="Clear search"
                         className="absolute inset-y-0 right-0 pr-3 flex items-center text-disabled hover:text-body-and-labels transition-colors"
                       >
                         <IconX />
@@ -610,6 +673,9 @@ function Home() {
                     <> of <span className="text-titles-and-attributes font-semibold">{data.length}</span></>
                   )}
                   {' '}record{data.length !== 1 ? 's' : ''}
+                  {loadWarning && (
+                    <span style={{ color: 'var(--medium)' }}> · {loadWarning}</span>
+                  )}
                 </span>
                 <span className="type-xs" style={{ minWidth: '6rem', textAlign: 'right' }}>
                   {hasActiveFilters ? (
@@ -622,66 +688,19 @@ function Home() {
                 </span>
               </div>
 
-              {/* Scrollable table */}
-              <div className="overflow-x-auto max-h-[55vh] overflow-y-auto tracker-scroll">
+              {/* Scrollable table — inline maxHeight: arbitrary-value classes
+                  like max-h-[55vh] don't exist in the prebuilt Toucan CSS */}
+              <div className="overflow-x-auto overflow-y-auto tracker-scroll" style={{ maxHeight: '55vh' }}>
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr>
                       <th className={`${thBase} w-8`} />
-                      <th
-                        className={thBase}
-                        onClick={() => handleSort('platform')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('platform')}
-                        aria-label={`Sort by platform${sortConfig.key === 'platform' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1">Platform{sortIndicator('platform')}</span>
-                      </th>
-                      <th
-                        className={thBase}
-                        onClick={() => handleSort('sensor_version')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('sensor_version')}
-                        aria-label={`Sort by version${sortConfig.key === 'sensor_version' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1">Version{sortIndicator('sensor_version')}</span>
-                      </th>
-                      <th
-                        className={thBase}
-                        onClick={() => handleSort('release_standing')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('release_standing')}
-                        aria-label={`Sort by standing${sortConfig.key === 'release_standing' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1">Standing{sortIndicator('release_standing')}</span>
-                      </th>
-                      <th
-                        className={thBase}
-                        onClick={() => handleSort('build_number')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('build_number')}
-                        aria-label={`Sort by build${sortConfig.key === 'build_number' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1">Build{sortIndicator('build_number')}</span>
-                      </th>
-                      <th
-                        className={thBase}
-                        onClick={() => handleSort('stage')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('stage')}
-                        aria-label={`Sort by stage${sortConfig.key === 'stage' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1">Stage{sortIndicator('stage')}</span>
-                      </th>
-                      <th
-                        className={`${thBase} text-right`}
-                        onClick={() => handleSort('first_seen_timestamp')}
-                        tabIndex={0}
-                        onKeyDown={(e) => e.key === 'Enter' && handleSort('first_seen_timestamp')}
-                        aria-label={`Sort by first seen${sortConfig.key === 'first_seen_timestamp' ? `, ${sortConfig.direction}ending` : ''}`}
-                      >
-                        <span className="inline-flex items-center gap-1 justify-end">First Seen{sortIndicator('first_seen_timestamp')}</span>
-                      </th>
+                      <SortableTh colKey="platform" label="Platform" sortConfig={sortConfig} onSort={handleSort} className={thBase} />
+                      <SortableTh colKey="sensor_version" label="Version" sortConfig={sortConfig} onSort={handleSort} className={thBase} />
+                      <SortableTh colKey="release_standing" label="Standing" sortConfig={sortConfig} onSort={handleSort} className={thBase} />
+                      <SortableTh colKey="build_number" label="Build" sortConfig={sortConfig} onSort={handleSort} className={thBase} />
+                      <SortableTh colKey="stage" label="Stage" sortConfig={sortConfig} onSort={handleSort} className={thBase} />
+                      <SortableTh colKey="first_seen_timestamp" label="First Seen" sortConfig={sortConfig} onSort={handleSort} className={`${thBase} text-right`} align="right" />
                     </tr>
                   </thead>
                   <tbody>
@@ -702,7 +721,8 @@ function Home() {
                       </tr>
                     ) : (
                       processedData.flatMap((row, i) => {
-                        const rowKey = `${row.platform}_${row.build_number}` || String(i);
+                        // stage disambiguates a build present in both prod and EA
+                        const rowKey = `${row.platform}_${row.build_number}_${row.stage || i}`;
                         const isExpanded = expandedRows.has(rowKey);
                         const history = Array.isArray(row.previous_standings) ? row.previous_standings : [];
                         const cleanHistory = history.filter((entry, idx) => {
