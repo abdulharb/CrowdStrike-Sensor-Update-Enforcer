@@ -142,8 +142,29 @@ def test_new_tagged_build_is_created(monkeypatch):
     )
     assert resp.code == 200
     assert resp.body["summary"]["new_entries_created"] == 1
+    assert resp.body["errors"] == []  # always a list, matching response_schema
     assert standings(store) == {"18909": "n-2"}
     assert store.objects["linux_18909"]["previous_standings"] == []
+
+
+def test_put_returning_bytes_counts_as_success(monkeypatch):
+    # The Foundry runtime's CustomStorage returns the stored object as bytes
+    # from PutObject (no status_code envelope). That must read as success.
+    class BytesPutStore(FakeStore):
+        def PutObject(self, collection_name=None, object_key=None, body=None, **kwargs):
+            super().PutObject(collection_name, object_key, body)
+            return json.dumps(body).encode("utf-8")
+
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    store = BytesPutStore()
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k: store)
+    monkeypatch.setattr(main, "SensorUpdatePolicies",
+                        lambda *a, **k: FakeSensor({"linux": [api_build("7.36.18909", "18909|n-2|tagged|6")]}))
+    req = Request(method="POST", url="/update-sensor-tracker",
+                  body={"platforms": ["linux"], "stage": "prod"})
+    resp = main.FUNC._router.route(req, logger=LOGGER)
+    assert resp.code == 200
+    assert resp.body["summary"]["new_entries_created"] == 1
 
 
 def test_unchanged_standing_is_skipped_no_put(monkeypatch):
@@ -161,8 +182,7 @@ def test_unchanged_standing_is_skipped_no_put(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # In-response tagged/untagged duplicate must NOT clobber the tagged record
-# (this is what line ~302's tagged_this_run skip protects -- verify removing
-#  the old guard didn't break it)
+# (this is what upsert_build_record's tagged_this_run skip protects)
 # ---------------------------------------------------------------------------
 
 def test_untagged_duplicate_does_not_clobber_new_build(monkeypatch):

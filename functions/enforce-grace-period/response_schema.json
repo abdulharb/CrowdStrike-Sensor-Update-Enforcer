@@ -101,7 +101,7 @@
         },
         "errors": {
             "type": "array",
-            "description": "List of errors encountered, or null if none",
+            "description": "Errors encountered during the run (empty when none)",
             "items": {
                 "type": "object",
                 "properties": {

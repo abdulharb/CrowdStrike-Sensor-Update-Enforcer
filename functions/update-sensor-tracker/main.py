@@ -11,7 +11,7 @@ import json
 import os
 import time
 from logging import Logger
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from crowdstrike.foundry.function import Function, Request, Response, APIError
 from falconpy import CustomStorage, SensorUpdatePolicies
@@ -20,6 +20,12 @@ FUNC = Function.instance()
 
 COLLECTION_NAME = "sensor_release_tracker"
 VALID_PLATFORMS = {"windows", "mac", "linux"}
+
+# Tagged standings (n, n-1, n-2) are processed before untagged builds. The API
+# returns the same build twice -- once tagged and once untagged -- so handling
+# tagged first means the real standing is set before the duplicate shows up.
+STANDING_PRIORITY = {"n": 0, "n-1": 1, "n-2": 2}
+UNTAGGED = "untagged"
 
 
 def is_debug_mode() -> bool:
@@ -30,6 +36,11 @@ def is_debug_mode() -> bool:
 def log_debug(logger: Logger, message: str) -> None:
     if is_debug_mode():
         logger.info(f"[DEBUG] {message}")
+
+
+def error_response(code: int, message: str) -> Response:
+    """Build the FDK error envelope used for every non-2xx return."""
+    return Response(code=code, errors=[APIError(code=code, message=message)])
 
 
 def parse_build_string(build_string: str) -> Dict[str, str]:
@@ -44,10 +55,10 @@ def parse_build_string(build_string: str) -> Dict[str, str]:
     if "|" in build_string:
         parts = build_string.split("|")
         build_number = parts[0]
-        release_standing = parts[1] if len(parts) > 1 else "untagged"
+        release_standing = parts[1] if len(parts) > 1 else UNTAGGED
     else:
         build_number = build_string
-        release_standing = "untagged"
+        release_standing = UNTAGGED
 
     return {
         "build_number": build_number,
@@ -95,6 +106,27 @@ def extract_error_message(response: Dict[str, Any]) -> str:
     return "Unknown error"
 
 
+def decode_object(resp: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalise a CustomStorage.GetObject reply to the stored record.
+
+    The Foundry runtime returns the raw object bytes; the local SDK returns a
+    {status_code, body} envelope. Anything else (404, 5xx) yields None.
+    """
+    if isinstance(resp, (bytes, bytearray)):
+        return json.loads(resp.decode("utf-8"))
+    if isinstance(resp, dict) and resp.get("status_code") == 200:
+        body = resp.get("body")
+        return body if isinstance(body, dict) else None
+    return None
+
+
+def put_succeeded(resp: Any) -> bool:
+    """PutObject returns bytes in the Foundry runtime and an envelope locally."""
+    return isinstance(resp, (bytes, bytearray)) or (
+        isinstance(resp, dict) and resp.get("status_code") == 200)
+
+
 def read_existing_record(
     storage: CustomStorage,
     collection_name: str,
@@ -103,25 +135,156 @@ def read_existing_record(
 ) -> Optional[Dict[str, Any]]:
     """
     Read the full record from the collection. Returns None if not found.
+
+    A 200 whose body is not the stored record (no "platform" field) is also
+    treated as not found, so the caller never merges into a wrapper envelope.
     """
     try:
         log_debug(logger, f"Reading record: {object_key}")
-        response = storage.GetObject(
-            collection_name=collection_name,
-            object_key=object_key,
-        )
-
-        if isinstance(response, bytes):
-            return json.loads(response.decode("utf-8"))
-        if isinstance(response, dict):
-            if response.get("status_code") == 200:
-                body = response.get("body", response)
-                return body if isinstance(body, dict) and "platform" in body else None
-            return None
-        return None
+        record = decode_object(storage.GetObject(
+            collection_name=collection_name, object_key=object_key))
+        return record if record and "platform" in record else None
     except Exception as e:
         log_debug(logger, f"Record not found: {object_key} - {e}")
         return None
+
+
+def fetch_sensor_builds(
+    falcon_sensor: SensorUpdatePolicies,
+    platforms: List[str],
+    stage: str,
+    logger: Logger,
+) -> Tuple[List[Dict[str, Any]], Optional[Response]]:
+    """
+    Fetch sensor builds for every platform, sorted tagged-first.
+
+    Returns (resources, error_response). The first failed platform aborts the
+    whole run: a partial tracker update would demote builds on the platforms
+    that did load while leaving the failed platform stale.
+    """
+    resources: List[Dict[str, Any]] = []
+    for platform in platforms:
+        logger.info(f"Fetching sensor builds for platform={platform}, stage={stage}")
+        resp = falcon_sensor.query_combined_builds(platform=platform, stage=stage)
+        if resp.get("status_code") != 200:
+            message = extract_error_message(resp)
+            logger.error(f"Failed to fetch sensor builds for {platform}: {message}")
+            code = resp.get("status_code", 500)
+            return [], error_response(code, f"Failed to fetch sensor builds for {platform}: {message}")
+
+        platform_resources = resp.get("body", {}).get("resources", [])
+        logger.info(f"Retrieved {len(platform_resources)} sensor builds for {platform}")
+        resources.extend(platform_resources)
+
+    logger.info(f"Total resources across all platforms: {len(resources)}")
+    resources.sort(key=lambda r: STANDING_PRIORITY.get(
+        parse_build_string(r.get("build", ""))["release_standing"], 99))
+    return resources, None
+
+
+def _entry_summary(object_key: str, platform: str, standing: str, build_number: str) -> Dict[str, Any]:
+    return {
+        "object_key": object_key,
+        "platform": platform,
+        "release_standing": standing,
+        "build_number": build_number,
+    }
+
+
+def upsert_build_record(
+    storage: CustomStorage,
+    resource: Dict[str, Any],
+    now: int,
+    tagged_this_run: Set[str],
+    logger: Logger,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Reconcile one API build resource with its collection record.
+
+    Returns (outcome, entry) where outcome is one of
+    "new", "updated", "skipped" or "error", and entry is the summary that goes
+    into the matching response list.
+    """
+    platform = resource.get("platform", "")
+    sensor_version = resource.get("sensor_version", "")
+    raw_build_string = resource.get("build", "")
+    build_info = parse_build_string(raw_build_string)
+    build_number = build_info["build_number"]
+    release_standing = build_info["release_standing"]
+    object_key = get_object_key(platform, build_number)
+    summary = _entry_summary(object_key, platform, release_standing, build_number)
+
+    log_debug(logger, f"Processing {object_key} standing={release_standing}")
+
+    # The API lists a still-tagged build a second time as untagged. If this
+    # run already recorded a tagged standing for it, skip the duplicate.
+    if release_standing == UNTAGGED and object_key in tagged_this_run:
+        log_debug(logger, f"Skipping untagged duplicate (already tagged this run): {object_key}")
+        return "skipped", summary
+    if release_standing != UNTAGGED:
+        tagged_this_run.add(object_key)
+
+    existing = read_existing_record(storage, COLLECTION_NAME, object_key, logger)
+
+    if existing is None:
+        log_debug(logger, f"Creating new entry: {object_key}")
+        record = {
+            "platform": platform,
+            "sensor_version": sensor_version,
+            "release_standing": release_standing,
+            "build_number": build_number,
+            "raw_build_string": raw_build_string,
+            "stage": resource.get("stage", ""),
+            "first_seen_timestamp": now,
+            "standing_updated_timestamp": now,
+            "previous_standings": [],
+        }
+        put_resp = storage.PutObject(body=record, collection_name=COLLECTION_NAME,
+                                     object_key=object_key)
+        if not put_succeeded(put_resp):
+            message = extract_error_message(put_resp)
+            logger.error(f"Failed to store {object_key}: {message}")
+            return "error", {"object_key": object_key, "error": f"Failed to store: {message}"}
+        logger.info(f"Created new entry: {object_key}")
+        return "new", dict(summary, sensor_version=sensor_version, first_seen_timestamp=now)
+
+    old_standing = existing.get("release_standing", "")
+    if old_standing == release_standing:
+        log_debug(logger, f"Skipping (no change): {object_key}")
+        return "skipped", summary
+
+    # Standing changed -- update the record in place, keeping the original
+    # first_seen_timestamp and sensor_version. An untagged build reaching
+    # here with a tagged stored standing has genuinely aged out of the
+    # n/n-1/n-2 window (the in-run duplicate was skipped above), so it is
+    # demoted to untagged. This keeps exactly one build per standing.
+    logger.info(f"Standing changed for {object_key}: {old_standing} -> {release_standing}")
+    prev = existing.get("previous_standings", [])
+    if not isinstance(prev, list):
+        prev = []
+    prev.append({
+        "standing": old_standing,
+        "timestamp": existing.get("standing_updated_timestamp")
+        or existing.get("first_seen_timestamp", now),
+    })
+    existing["release_standing"] = release_standing
+    existing["raw_build_string"] = raw_build_string
+    existing["previous_standings"] = prev
+    existing["standing_updated_timestamp"] = now
+
+    put_resp = storage.PutObject(body=existing, collection_name=COLLECTION_NAME,
+                                 object_key=object_key)
+    if not put_succeeded(put_resp):
+        message = extract_error_message(put_resp)
+        logger.error(f"Failed to update {object_key}: {message}")
+        return "error", {"object_key": object_key, "error": f"Failed to update: {message}"}
+    return "updated", {
+        "object_key": object_key,
+        "platform": platform,
+        "old_standing": old_standing,
+        "new_standing": release_standing,
+        "build_number": build_number,
+    }
 
 
 @FUNC.handler(method="POST", path="/update-sensor-tracker")
@@ -143,32 +306,18 @@ def update_sensor_tracker_handler(
         logger.info("Starting sensor release tracker update")
         log_debug(logger, f"DEBUG_MODE: {os.environ.get('DEBUG_MODE', 'not set')}")
 
-        body = request.body if request.body else {}
+        body = request.body or {}
         platforms = body.get("platforms", ["windows"])
         stage = body.get("stage", "prod")
 
-        if not isinstance(platforms, list) or len(platforms) == 0:
-            return Response(
-                code=400,
-                errors=[
-                    APIError(
-                        code=400,
-                        message="'platforms' must be a non-empty array of strings (windows, mac, linux)",
-                    )
-                ],
-            )
+        if not isinstance(platforms, list) or not platforms:
+            return error_response(
+                400, "'platforms' must be a non-empty array of strings (windows, mac, linux)")
 
         invalid_platforms = [p for p in platforms if p not in VALID_PLATFORMS]
         if invalid_platforms:
-            return Response(
-                code=400,
-                errors=[
-                    APIError(
-                        code=400,
-                        message=f"Invalid platform(s): {invalid_platforms}. Allowed: windows, mac, linux",
-                    )
-                ],
-            )
+            return error_response(
+                400, f"Invalid platform(s): {invalid_platforms}. Allowed: windows, mac, linux")
 
         logger.info(f"Querying platforms: {platforms}, stage: {stage}")
 
@@ -178,226 +327,49 @@ def update_sensor_tracker_handler(
         # ext_headers applies X-CS-APP-ID to every request.
         storage = CustomStorage(ext_headers=get_headers())
 
-        # Fetch sensor builds from API
-        resources = []
-        for platform in platforms:
-            logger.info(f"Fetching sensor builds for platform={platform}, stage={stage}")
-            sensor_response = falcon_sensor.query_combined_builds(
-                platform=platform, stage=stage
-            )
+        resources, err = fetch_sensor_builds(falcon_sensor, platforms, stage, logger)
+        if err:
+            return err
 
-            if sensor_response.get("status_code") != 200:
-                error_message = extract_error_message(sensor_response)
-                logger.error(f"Failed to fetch sensor builds for {platform}: {error_message}")
-                return Response(
-                    code=sensor_response.get("status_code", 500),
-                    errors=[
-                        APIError(
-                            code=sensor_response.get("status_code", 500),
-                            message=f"Failed to fetch sensor builds for {platform}: {error_message}",
-                        )
-                    ],
-                )
+        now = get_current_timestamp()
+        tagged_this_run: Set[str] = set()
+        results: Dict[str, List[Dict[str, Any]]] = {
+            "new": [], "updated": [], "skipped": [], "error": []}
 
-            platform_resources = sensor_response.get("body", {}).get("resources", [])
-            logger.info(f"Retrieved {len(platform_resources)} sensor builds for {platform}")
-            resources.extend(platform_resources)
-
-        logger.info(f"Total resources across all platforms: {len(resources)}")
-
-        # Sort resources: tagged standings (n, n-1, n-2) first, untagged last.
-        # The API returns the same build twice -- once tagged and once untagged.
-        # Processing tagged first ensures we set the real standing before seeing
-        # the untagged duplicate.
-        STANDING_PRIORITY = {"n": 0, "n-1": 1, "n-2": 2}
-
-        def resource_sort_key(r):
-            info = parse_build_string(r.get("build", ""))
-            return STANDING_PRIORITY.get(info["release_standing"], 99)
-
-        resources.sort(key=resource_sort_key)
-        logger.info("Sorted resources: tagged standings first, untagged last")
-
-        # Track which builds we've already set a tagged standing for in this run,
-        # so we don't let the untagged duplicate overwrite it.
-        tagged_this_run = set()
-
-        # Track results
-        new_entries = []
-        updated_entries = []
-        skipped_entries = []
-        errors = []
-        current_timestamp = get_current_timestamp()
-
-        # Process each sensor build
-        for idx, resource in enumerate(resources):
+        for resource in resources:
             try:
-                platform = resource.get("platform", "")
-                sensor_version = resource.get("sensor_version", "")
-                raw_build_string = resource.get("build", "")
-                resource_stage = resource.get("stage", "")
-
-                build_info = parse_build_string(raw_build_string)
-                build_number = build_info["build_number"]
-                release_standing = build_info["release_standing"]
-
-                object_key = get_object_key(platform, build_number)
-                log_debug(logger, f"Processing {idx + 1}/{len(resources)}: {object_key} standing={release_standing}")
-
-                # If this build already got a tagged standing in this run,
-                # skip the untagged duplicate from the API.
-                if release_standing == "untagged" and object_key in tagged_this_run:
-                    log_debug(logger, f"Skipping untagged duplicate (already tagged this run): {object_key}")
-                    skipped_entries.append({
-                        "object_key": object_key,
-                        "platform": platform,
-                        "release_standing": release_standing,
-                        "build_number": build_number,
-                    })
-                    continue
-
-                # Track tagged standings set in this run
-                if release_standing != "untagged":
-                    tagged_this_run.add(object_key)
-
-                # Read existing record
-                existing = read_existing_record(
-                    storage, COLLECTION_NAME, object_key, logger
-                )
-
-                if existing is not None:
-                    old_standing = existing.get("release_standing", "")
-
-                    # Note: the API's tagged/untagged duplicate of a still-tagged
-                    # build is already skipped above (object_key in tagged_this_run).
-                    # So an untagged build reaching here with a tagged stored
-                    # standing has genuinely aged out of the n/n-1/n-2 window and
-                    # falls through to the standing-changed path below, which
-                    # demotes it to untagged. This keeps exactly one build per
-                    # standing instead of letting aged-out builds pile up.
-
-                    if old_standing == release_standing:
-                        # No change
-                        skipped_entries.append({
-                            "object_key": object_key,
-                            "platform": platform,
-                            "release_standing": release_standing,
-                            "build_number": build_number,
-                        })
-                        log_debug(logger, f"Skipping (no change): {object_key}")
-                        continue
-
-                    # Standing changed -- update the record
-                    logger.info(f"Standing changed for {object_key}: {old_standing} -> {release_standing}")
-
-                    prev = existing.get("previous_standings", [])
-                    if not isinstance(prev, list):
-                        prev = []
-
-                    # Append old standing to history
-                    old_timestamp = existing.get("standing_updated_timestamp") or existing.get("first_seen_timestamp", current_timestamp)
-                    prev.append({
-                        "standing": old_standing,
-                        "timestamp": old_timestamp,
-                    })
-
-                    # Update record in place
-                    existing["release_standing"] = release_standing
-                    existing["raw_build_string"] = raw_build_string
-                    existing["previous_standings"] = prev
-                    existing["standing_updated_timestamp"] = current_timestamp
-                    # Keep original first_seen_timestamp and sensor_version
-
-                    put_response = storage.PutObject(
-                        body=existing,
-                        collection_name=COLLECTION_NAME,
-                        object_key=object_key,
-                    )
-
-                    if isinstance(put_response, bytes) or put_response.get("status_code") == 200:
-                        updated_entries.append({
-                            "object_key": object_key,
-                            "platform": platform,
-                            "old_standing": old_standing,
-                            "new_standing": release_standing,
-                            "build_number": build_number,
-                        })
-                    else:
-                        error_msg = extract_error_message(put_response)
-                        errors.append({"object_key": object_key, "error": f"Failed to update: {error_msg}"})
-                        logger.error(f"Failed to update {object_key}: {error_msg}")
-                else:
-                    # New record
-                    log_debug(logger, f"Creating new entry: {object_key}")
-                    collection_entry = {
-                        "platform": platform,
-                        "sensor_version": sensor_version,
-                        "release_standing": release_standing,
-                        "build_number": build_number,
-                        "raw_build_string": raw_build_string,
-                        "stage": resource_stage,
-                        "first_seen_timestamp": current_timestamp,
-                        "standing_updated_timestamp": current_timestamp,
-                        "previous_standings": [],
-                    }
-
-                    put_response = storage.PutObject(
-                        body=collection_entry,
-                        collection_name=COLLECTION_NAME,
-                        object_key=object_key,
-                    )
-
-                    if isinstance(put_response, bytes) or put_response.get("status_code") == 200:
-                        new_entries.append({
-                            "object_key": object_key,
-                            "platform": platform,
-                            "release_standing": release_standing,
-                            "build_number": build_number,
-                            "sensor_version": sensor_version,
-                            "first_seen_timestamp": current_timestamp,
-                        })
-                        logger.info(f"Created new entry: {object_key}")
-                    else:
-                        error_msg = extract_error_message(put_response)
-                        errors.append({"object_key": object_key, "error": f"Failed to store: {error_msg}"})
-                        logger.error(f"Failed to store {object_key}: {error_msg}")
-
+                outcome, entry = upsert_build_record(storage, resource, now, tagged_this_run, logger)
             except Exception as e:
-                errors.append({"resource": resource, "error": str(e)})
+                outcome, entry = "error", {"resource": resource, "error": str(e)}
                 logger.error(f"Error processing resource: {e}", exc_info=True)
+            results[outcome].append(entry)
 
+        errors = results["error"]
         logger.info(
-            f"Complete - new: {len(new_entries)}, updated: {len(updated_entries)}, "
-            f"skipped: {len(skipped_entries)}, errors: {len(errors)}"
+            f"Complete - new: {len(results['new'])}, updated: {len(results['updated'])}, "
+            f"skipped: {len(results['skipped'])}, errors: {len(errors)}"
         )
 
         response_body = {
-            "success": len(errors) == 0,
-            "timestamp": current_timestamp,
+            "success": not errors,
+            "timestamp": now,
             "summary": {
                 "total_api_records": len(resources),
-                "new_entries_created": len(new_entries),
-                "entries_updated": len(updated_entries),
-                "existing_entries_skipped": len(skipped_entries),
+                "new_entries_created": len(results["new"]),
+                "entries_updated": len(results["updated"]),
+                "existing_entries_skipped": len(results["skipped"]),
                 "errors": len(errors),
             },
-            "new_entries": new_entries,
-            "updated_entries": updated_entries,
-            "skipped_entries": skipped_entries,
-            "errors": errors if errors else None,
+            "new_entries": results["new"],
+            "updated_entries": results["updated"],
+            "skipped_entries": results["skipped"],
+            "errors": errors,
         }
-
-        return Response(
-            body=response_body,
-            code=200 if len(errors) == 0 else 207,
-        )
+        return Response(body=response_body, code=200 if not errors else 207)
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
-        return Response(
-            code=500,
-            errors=[APIError(code=500, message=f"Internal error: {e}")],
-        )
+        return error_response(500, f"Internal error: {e}")
 
 
 if __name__ == "__main__":

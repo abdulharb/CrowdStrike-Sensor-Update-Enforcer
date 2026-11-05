@@ -9,11 +9,6 @@ Field shapes here mirror what the live US-2 tenant actually returns
                       capitalized; settings.build / settings.sensor_version
   - group members:    device_id, platform_name (capitalized), agent_version, hostname
 
-Some tests DOCUMENT current behavior that the review flagged as risky
-(empty agent_version -> treated stale -> force-updated). Those are marked
-with `BEHAVIOR:` so a future fix flips the assertion intentionally, not by
-accident.
-
 The handler is registered on FUNC via @FUNC.handler; it's invoked through
 FUNC._router.route(). falconpy clients are replaced with in-memory fakes.
 """
@@ -197,18 +192,17 @@ def test_source_policy_single_match_maps_standing():
     assert targets["windows"]["policy_sensor_version"] == "7.36.20805"
 
 
-def test_source_policy_two_policies_same_platform_does_not_crash():
-    # Live reality: precedence key absent -> both default to 9999.
-    # Two Windows policies attached to the source group must NOT raise
+def test_source_policy_two_policies_same_platform_keeps_first():
+    # Live reality: the combined-policies API omits 'precedence', so two
+    # Windows policies attached to the source group can't be ranked. The
+    # first one returned wins and the second is logged, never raised
     # (this is the exact US-2 config: 'Force Update' + 'Normal').
     sensor = FakeSensor([
         policy("Force Update", groups=("SRC",)),
-        policy("Normal", groups=("SRC", "OTHER")),
+        policy("Normal", groups=("SRC", "OTHER"), build="20907|n-1|tagged|1"),
     ])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
     assert targets["windows"]["target_standing"] == "n-2"
-    # BEHAVIOR: selection is first-returned-wins (precedence is non-functional
-    # because the API omits it). If precedence handling is fixed, update this.
     assert targets["windows"]["policy_name"] == "Force Update"
 
 
@@ -232,22 +226,67 @@ def test_source_policy_target_standing_override():
 
 
 def test_source_policy_untagged_does_not_replace_valid_target():
-    # A pinned (untagged) policy with better precedence must not clobber an
-    # already-found valid target -- and must not log a bogus "Replacing".
+    # A pinned (untagged) policy must not clobber an already-found valid target.
     pinned = policy("Pinned", build="20505", sensor_version="7.33.20505")
-    pinned["precedence"] = 1
     sensor = FakeSensor([policy("Force Update", groups=("SRC",)), pinned])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
     assert targets["windows"]["policy_name"] == "Force Update"
     assert targets["windows"]["target_standing"] == "n-2"
 
 
-def test_source_policy_disabled_policy_currently_still_used():
-    # BEHAVIOR: the code does NOT filter enabled=False. CrowdStrike ignores
-    # disabled policies; this documents the current divergence.
+def test_source_policy_disabled_policy_is_ignored():
+    # CrowdStrike does not apply disabled policies, so neither do we -- even
+    # when the disabled one is returned first.
     sensor = FakeSensor([policy("Disabled", enabled=False, groups=("SRC",))])
+    assert main.get_source_policy_targets(sensor, "SRC", None, LOGGER) == {}
+
+    sensor = FakeSensor([
+        policy("Disabled", enabled=False, groups=("SRC",), build="20907|n-1|tagged|1"),
+        policy("Live", groups=("SRC",)),
+    ])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
-    assert "windows" in targets  # flip to `== {}` when enabled-filtering is added
+    assert targets["windows"]["policy_name"] == "Live"
+    assert targets["windows"]["target_standing"] == "n-2"
+
+
+def test_source_policy_paginates_until_total():
+    # Two pages of 200 policies; the attached one is on page 2.
+    class PagedSensor:
+        def __init__(self):
+            self.offsets = []
+
+        def query_combined_policies_v2(self, limit=200, offset=0):
+            self.offsets.append(offset)
+            page = [policy(f"p{i}", groups=("OTHER",)) for i in range(offset, min(offset + limit, 250))]
+            if offset + limit >= 250:
+                page[-1] = policy("Attached", groups=("SRC",))
+            return _resp(page, total=250)
+
+    sensor = PagedSensor()
+    targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
+    assert sensor.offsets == [0, 200]
+    assert targets["windows"]["policy_name"] == "Attached"
+
+
+def test_paginate_stops_on_error_and_keeps_partial():
+    calls = []
+
+    def fetch(offset):
+        calls.append(offset)
+        if offset == 0:
+            return _resp([{"id": 1}], total=5)
+        return {"status_code": 500, "body": {"errors": [{"message": "boom"}]}}
+
+    assert main.paginate(fetch, "things", LOGGER) == [{"id": 1}]
+    assert calls == [0, 1]
+
+
+def test_decode_object_shapes():
+    rec = {"sensor_version": "7.36.20805"}
+    assert main.decode_object(json.dumps(rec).encode("utf-8")) == rec
+    assert main.decode_object({"status_code": 200, "body": rec}) == rec
+    assert main.decode_object({"status_code": 404, "body": {"errors": []}}) is None
+    assert main.decode_object({"status_code": 200, "body": "not-a-dict"}) is None
 
 
 # ===========================================================================
@@ -293,32 +332,38 @@ def test_cleanup_unparseable_target_skips_platform():
 
 
 # ===========================================================================
-# find_stale_hosts_in_source  (Phase B candidate selection)
+# find_stale_hosts  (Phase B candidate selection)
 # ===========================================================================
 
 def test_stale_finds_behind_hosts():
-    hg = FakeHostGroup({"SRC": [device("d1", "7.30.20000"), device("d2", "7.36.20805")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", set(), LOGGER)
+    members = [device("d1", "7.30.20000"), device("d2", "7.36.20805")]
+    out = main.find_stale_hosts(members, "7.36.20805", set(), LOGGER)
     assert [d["device_id"] for d in out] == ["d1"]
 
 
 def test_stale_skips_hosts_already_in_force_group():
-    hg = FakeHostGroup({"SRC": [device("d1", "7.30.20000")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", {"d1"}, LOGGER)
-    assert out == []
+    members = [device("d1", "7.30.20000")]
+    assert main.find_stale_hosts(members, "7.36.20805", {"d1"}, LOGGER) == []
 
 
 def test_stale_empty_agent_version_is_skipped():
-    # E2 fix: blank/unparseable version -> NOT enforced (skip+log), instead of
-    # being force-updated off (0,0,0).
-    hg = FakeHostGroup({"SRC": [device("d1", ""), device("d2", "garbage"),
-                                device("d3", "7.30.20000")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", set(), LOGGER)
+    # Blank/unparseable version -> NOT enforced (skip+log), instead of being
+    # force-updated off (0,0,0).
+    members = [device("d1", ""), device("d2", "garbage"), device("d3", "7.30.20000")]
+    out = main.find_stale_hosts(members, "7.36.20805", set(), LOGGER)
     # Only the host with a real, behind version is enforced.
     assert [d["device_id"] for d in out] == ["d3"]
+
+
+def test_source_group_members_are_queried_per_platform():
+    # Phase B asks the API for one platform at a time; the fake honours the
+    # platform_name filter, so a Mac host in the source group is never seen
+    # when enforcing Windows.
+    hg = FakeHostGroup({"SRC": [device("w1", "7.30.20000"),
+                                device("m1", "7.30.20000", platform_name="Mac")]})
+    members = main.get_group_members(hg, "SRC", LOGGER, label="source group",
+                                     fql_filter="platform_name:'Windows'")
+    assert [d["device_id"] for d in members] == ["w1"]
 
 
 def test_has_known_version():
@@ -407,6 +452,26 @@ def test_handler_grace_period_out_of_range_returns_400(monkeypatch):
         assert resp.code == 400, f"grace_period_days={bad} should be rejected"
 
 
+def test_handler_invalid_platform_returns_400(monkeypatch):
+    resp = _route(monkeypatch, sensor=FakeSensor([]), hg=FakeHostGroup(),
+                  store=FakeStore(), body={"platforms": ["solaris"]}, env=BASE_ENV)
+    assert resp.code == 400
+    assert "solaris" in resp.errors[0].message
+
+
+def test_handler_group_action_failure_returns_207(monkeypatch):
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",))])
+    store = FakeStore({("Windows", "n-2"): collection_record("7.36.20805", first_seen=1)})
+    hg = FakeHostGroup({"FORCE": [], "SRC": [device("s_stale", "7.30.20000")]},
+                       action_status=500)
+    resp = _route(monkeypatch, sensor=sensor, hg=hg, store=store, body={}, env=BASE_ENV)
+    assert resp.code == 207
+    assert resp.body["success"] is False
+    assert resp.body["errors"][0]["operation"] == "add-hosts"
+    assert resp.body["enforcement"]["hosts_added"] == 0
+    assert resp.body["enforcement"]["platform_details"][0]["stale_hosts_found"] == 1
+
+
 def test_handler_no_policy_on_source_returns_400(monkeypatch):
     # Policy exists but not attached to the source group.
     sensor = FakeSensor([policy("platform_default", groups=("OTHER",))])
@@ -429,6 +494,7 @@ def test_handler_full_cycle_cleanup_and_enforce(monkeypatch):
 
     assert resp.code == 200
     assert resp.body["success"] is True
+    assert resp.body["errors"] == []  # always a list, matching response_schema
     assert resp.body["cleanup"]["hosts_removed"] == 1
     assert resp.body["enforcement"]["hosts_added"] == 1
     removed = {h["device_id"] for h in resp.body["cleanup"]["removed_hosts"]}

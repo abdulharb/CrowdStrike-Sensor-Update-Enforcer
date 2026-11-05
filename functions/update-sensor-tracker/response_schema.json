@@ -83,7 +83,7 @@
         },
         "errors": {
             "type": "array",
-            "description": "List of errors encountered during processing, empty if none",
+            "description": "Errors encountered during processing (empty when none)",
             "items": { "type": "object" }
         }
     },

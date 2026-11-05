@@ -32,7 +32,7 @@ Two Foundry Functions run on a bundled scheduled workflow (every 4 hours):
 
 ### 1. update-sensor-tracker
 
-Polls the CrowdStrike sensor builds API and records when new versions appear at each release standing (N, N-1, N-2) in a Foundry Collection with timestamps. This collection is the source of truth for when a version first appeared -- which is how the grace period is calculated.
+Polls the CrowdStrike sensor builds API and keeps one record per build in a Foundry Collection: when it first appeared (`first_seen_timestamp`), its current standing (N, N-1, N-2, untagged), and when it was last promoted to that standing (`standing_updated_timestamp`). The promotion time is what the grace period is measured from -- a build that was N for weeks only starts its grace clock once it becomes N-2.
 
 ### 2. enforce-grace-period
 
@@ -40,7 +40,7 @@ Reads the source host group's sensor update policy to determine the target stand
 
 **Phase A - Cleanup (always runs):** Checks hosts in the force update group. If a host's sensor version now meets the source policy's target, it gets removed from the force group -- back to the normal maintenance-window-only policy.
 
-**Phase B - Enforcement (after grace period):** Looks up when the current build at the target standing first appeared in the collection. If the grace period has expired, finds hosts in the source group that are still behind and adds them to the force update group in batches.
+**Phase B - Enforcement (after grace period):** Looks up when the current build at the target standing was promoted to that standing in the collection. If the grace period has expired since then, finds hosts in the source group that are still behind and adds them to the force update group in batches. Hosts that report no parseable sensor version are skipped, never forced.
 
 ### Sensor Release Tracker UI
 
@@ -101,16 +101,18 @@ environment_variables:
 
 ### Step 5: Build the UI and Deploy
 
-The manifest deploys the UI's `dist/` output as-is, so build it first:
+The manifest deploys the UI's `src/dist` output as-is, so build it first (from the repo root):
 
 ```bash
-cd "Sensor Update Enforcer/ui/pages/Sensor Release Tracker"
+cd "ui/pages/Sensor Release Tracker"
 pnpm install && pnpm build
 cd ../../..
 foundry apps deploy --change-type Patch --change-log "description of changes"
 ```
 
 `--change-type` and `--change-log` are required -- omitting them causes a 500 error.
+
+CI (`.github/workflows/ci.yml`) runs both functions' tests and rebuilds the UI, failing if the committed `src/dist` is out of date.
 
 ### Step 6: Scheduled Workflow (automatic)
 
@@ -199,7 +201,7 @@ POST /update-sensor-tracker
     "new_entries": [...],
     "updated_entries": [...],
     "skipped_entries": [...],
-    "errors": null
+    "errors": []
 }
 ```
 
@@ -229,6 +231,9 @@ POST /update-sensor-tracker
             "platform": "windows",
             "target_standing": "n-2",
             "target_version": "7.14.20407",
+            "policy_name": "Windows - Maintenance Window",
+            "first_seen_timestamp": 1709078400,
+            "standing_updated_timestamp": 1711393920,
             "grace_period_expired": true,
             "days_since_release": 4.2,
             "stale_hosts_found": 3,
@@ -238,7 +243,7 @@ POST /update-sensor-tracker
             {"device_id": "def456", "hostname": "LAPTOP-2", "platform": "Windows", "agent_version": "7.13.20103"}
         ]
     },
-    "errors": null
+    "errors": []
 }
 ```
 
@@ -279,7 +284,9 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 - Verify the source group's policy has a tagged build string (not untagged) -- or set the `TARGET_STANDING` env var to specify the standing manually
 
 **Hosts aren't being added to the force group**
-- Check that `GRACE_PERIOD_DAYS` has elapsed since the version first appeared
+- Check that `GRACE_PERIOD_DAYS` has elapsed since the build was promoted to the target standing (`standing_updated_timestamp` in the response's `platform_details`), not since it first appeared
+- A record with `standing_updated_timestamp: 0` (written before that field existed) is skipped until `update-sensor-tracker` sees the next standing change
+- The source group must be attached to exactly one **enabled** policy per platform; disabled policies are ignored and extra ones are logged
 - Use `dry_run: true` to see what the app would do
 - Verify `SOURCE_GROUP_ID` points to the correct group
 - Check that the source policy is actually attached to the source group
@@ -298,10 +305,11 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 ## Project Structure
 
 ```
-Sensor Update Enforcer/
+.
 ├── manifest.yml                           # Foundry app manifest
 ├── README.md
 ├── ARCHITECTURE.md                        # Detailed flow diagram (Mermaid)
+├── .github/workflows/ci.yml               # Function tests + UI build check
 ├── collections/
 │   └── sensor_release_tracker.json        # Foundry Collection schema
 ├── functions/

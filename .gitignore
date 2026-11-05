@@ -11,3 +11,4 @@ node_modules/
 recon.py
 .falcon_env
 *.creds
+.idea/

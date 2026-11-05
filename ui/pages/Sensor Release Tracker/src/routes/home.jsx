@@ -1,182 +1,18 @@
-import React, { useContext, useEffect, useState, useMemo, useCallback } from "react";
+import { useContext, useState, useMemo, useCallback } from "react";
 import { FalconApiContext } from "../contexts/falcon-api-context";
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import { SlSpinner, SlAlert } from '@shoelace-style/shoelace/dist/react';
 
-// ─── Inline SVG Icons (avoids CSP issues with Shoelace icon CDN) ─
-
-function IconRefresh({ size = 14, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M14 8A6 6 0 1 1 8 2" /><path d="M14 2v4h-4" />
-    </svg>
-  );
-}
-
-function IconSearch({ size = 14, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-      <circle cx="6.5" cy="6.5" r="4.5" /><path d="M10 10l4 4" />
-    </svg>
-  );
-}
-
-function IconX({ size = 14, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-      <path d="M4 4l8 8M12 4l-8 8" />
-    </svg>
-  );
-}
-
-function IconWarning({ size = 16, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
-      <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
-    </svg>
-  );
-}
-
-function IconChevron({ size = 12, expanded = false, className = '' }) {
-  return (
-    <svg
-      className={className}
-      style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 150ms ease' }}
-      width={size} height={size} viewBox="0 0 16 16" fill="none"
-      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-    >
-      <path d="M6 4l4 4-4 4" />
-    </svg>
-  );
-}
-
-function IconCopy({ size = 14, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="5" y="5" width="9" height="9" rx="1.5" /><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5" />
-    </svg>
-  );
-}
-
-function IconCheck({ size = 14, className = '' }) {
-  return (
-    <svg className={className} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M3 8.5l3.5 3.5 6.5-7" />
-    </svg>
-  );
-}
-
-// Up/down triangles — dim the inactive direction, brighten the active one
-function IconSort({ size = 9, direction = null, className = '' }) {
-  return (
-    <svg
-      className={className}
-      width={size} height={Math.round(size * 1.6)}
-      viewBox="0 0 10 16"
-      fill="currentColor"
-      aria-hidden="true"
-      style={{ flexShrink: 0 }}
-    >
-      <path d="M5 1L9 6H1z" style={{ opacity: direction === 'asc' ? 1 : 0.3 }} />
-      <path d="M5 15L1 10H9z" style={{ opacity: direction === 'desc' ? 1 : 0.3 }} />
-    </svg>
-  );
-}
-
-// ─── Configuration ───────────────────────────────────────────────
-
-const PLATFORM = {
-  mac:     { label: 'macOS' },
-  windows: { label: 'Windows' },
-  linux:   { label: 'Linux' },
-};
-
-// Severity ramp: the further from current, the more the enforcer cares.
-// N (current) → blue, N-1 (supported) → green, N-2 (aging) → amber,
-// untagged (out of support / force-update target) → red.
-const STANDING = {
-  'n':        { label: 'N',        badge: 'badge-informational', dotVar: '--informational' },
-  'n-1':      { label: 'N-1',      badge: 'badge-positive',      dotVar: '--positive' },
-  'n-2':      { label: 'N-2',      badge: 'badge-medium',        dotVar: '--medium' },
-  'untagged': { label: 'Untagged', badge: 'badge-high',          dotVar: '--high' },
-};
-
-const STAGE = {
-  prod:          { label: 'Prod', badge: 'badge-informational' },
-  early_adopter: { label: 'EA',   badge: 'badge-purple' },
-};
-
-const MOCK_DATA = [
-  { platform: 'windows', sensor_version: '7.32.20403',  release_standing: 'n',        build_number: '20403', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 86400 },
-  { platform: 'windows', sensor_version: '7.32.20407',  release_standing: 'n',        build_number: '20407', stage: 'early_adopter', first_seen_timestamp: Date.now() / 1000 - 43200 },
-  { platform: 'windows', sensor_version: '7.30.20103',  release_standing: 'n-1',      build_number: '20103', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 864000 },
-  { platform: 'windows', sensor_version: '7.28.19500',  release_standing: 'n-2',      build_number: '19500', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 2592000 },
-  { platform: 'windows', sensor_version: '7.26.18900',  release_standing: 'untagged', build_number: '18900', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 5184000 },
-  { platform: 'mac',     sensor_version: '7.32.20401',  release_standing: 'n',        build_number: '20401', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 86400 },
-  { platform: 'mac',     sensor_version: '7.32.20405',  release_standing: 'n',        build_number: '20405', stage: 'early_adopter', first_seen_timestamp: Date.now() / 1000 - 21600 },
-  { platform: 'mac',     sensor_version: '7.30.20100',  release_standing: 'n-1',      build_number: '20100', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 864000 },
-  { platform: 'mac',     sensor_version: '7.28.19400',  release_standing: 'n-2',      build_number: '19400', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 2592000 },
-  { platform: 'linux',   sensor_version: '7.32.20400',  release_standing: 'n',        build_number: '20400', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 172800 },
-  { platform: 'linux',   sensor_version: '7.30.20098',  release_standing: 'n-1',      build_number: '20098', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 950400 },
-  { platform: 'linux',   sensor_version: '7.28.19498',  release_standing: 'n-2',      build_number: '19498', stage: 'prod',          first_seen_timestamp: Date.now() / 1000 - 2678400 },
-];
-
-// ─── Helpers ─────────────────────────────────────────────────────
-
-function relativeTime(ts) {
-  if (!ts) return '';
-  const sec = Math.floor(Date.now() / 1000 - ts);
-  if (sec < 60)    return 'just now';
-  if (sec < 3600)  return `${Math.floor(sec / 60)}m ago`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
-  const days = Math.floor(sec / 86400);
-  if (days < 30)   return `${days}d ago`;
-  return `${Math.floor(days / 30)}mo ago`;
-}
-
-function formatDate(ts) {
-  if (!ts) return '\u2014';
-  return new Date(ts * 1000).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  });
-}
+import { PLATFORM, STANDING, STAGE } from '../lib/constants';
+import { relativeTime, formatDate, compareVersions, standingTimeline } from '../lib/format';
+import { useSensorReleases } from '../hooks/use-sensor-releases';
+import { IconRefresh, IconSearch, IconX, IconWarning, IconChevron, IconCopy, IconCheck, IconSort } from '../components/icons';
+import { PlatformBadge, StandingBadge, StageBadge } from '../components/badges';
+import { PlatformCard } from '../components/platform-card';
+import { StandingHistory } from '../components/standing-history';
 
 // ─── Sub-components ──────────────────────────────────────────────
-
-function PlatformBadge({ platform }) {
-  const key = platform?.toLowerCase();
-  const meta = PLATFORM[key] || { label: platform || 'Unknown' };
-  return (
-    <span className="inline-flex items-center px-2.5 py-1 rounded text-xs font-medium bg-surface-lg text-titles-and-attributes border border-border-faint">
-      {meta.label}
-    </span>
-  );
-}
-
-function StandingBadge({ standing }) {
-  const meta = STANDING[standing] || STANDING.untagged;
-  const isCurrent = standing === 'n';
-  return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium border ${meta.badge}`}>
-      <span
-        className={`w-1.5 h-1.5 rounded-full flex-shrink-0${isCurrent ? ' status-dot-current' : ''}`}
-        style={{ backgroundColor: `var(${meta.dotVar})` }}
-      />
-      {meta.label}
-    </span>
-  );
-}
-
-function StageBadge({ stage }) {
-  const meta = STAGE[stage] || { label: stage || '?', badge: 'badge-neutral' };
-  return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded font-bold uppercase tracking-wider border ${meta.badge}`} style={{ fontSize: '0.65rem' }}>
-      {meta.label}
-    </span>
-  );
-}
 
 function FilterPills({ label, options, value, onChange }) {
   return (
@@ -223,29 +59,34 @@ function SortableTh({ colKey, label, sortConfig, onSort, className, align }) {
   );
 }
 
-// ─── Version sort helper ─────────────────────────────────────────
-// Splits "7.32.20403" into numeric parts so 7.9 < 7.10 sorts correctly
-function compareVersions(a, b) {
-  const ap = String(a).split('.').map(Number);
-  const bp = String(b).split('.').map(Number);
-  for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
-    const diff = (ap[i] ?? 0) - (bp[i] ?? 0);
-    if (diff !== 0) return diff;
+// Foundry's sandboxed iframe blocks downloads AND popups, so "export" means
+// copy to clipboard. The Clipboard API is often blocked in sandboxed
+// cross-origin iframes too — fall back to the legacy execCommand path.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+    return ok;
   }
-  return 0;
 }
 
 // ─── Main Component ──────────────────────────────────────────────
 
 function Home() {
   const { falcon, isInitialized } = useContext(FalconApiContext);
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
-  const [loadWarning, setLoadWarning] = useState(null);
-  const [usingMockData, setUsingMockData] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const {
+    data, loading, refreshing, error, loadWarning, usingMockData, lastUpdated, reload, refresh,
+  } = useSensorReleases(falcon, isInitialized);
   const [exportStatus, setExportStatus] = useState('idle');
 
   // Filters
@@ -269,99 +110,12 @@ function Home() {
     });
   }, []);
 
-  // ── Data fetching ──────────────────────────────────────
-  const fetchData = useCallback(async (isRefresh = false) => {
-    try {
-      if (isRefresh) setRefreshing(true);
-      else setLoading(true);
-      setError(null);
-      setLoadWarning(null);
-
-      if (!falcon.isConnected) {
-        console.log('Falcon not connected — using mock data for preview.');
-        setUsingMockData(true);
-        setData(MOCK_DATA);
-        setLastUpdated(new Date());
-        return;
-      }
-      setUsingMockData(false);
-
-      const col = falcon.collection({ collection: 'sensor_release_tracker' });
-      const keysRes = await col.list({ limit: 500 });
-      if (keysRes?.errors?.length) {
-        throw new Error(keysRes.errors[0]?.message || 'Collection list failed');
-      }
-      const keys = keysRes.resources || [];
-
-      if (keys.length === 0) {
-        setData([]);
-        setLastUpdated(new Date());
-        return;
-      }
-
-      // Read in small batches — a flat Promise.all over hundreds of keys
-      // trips the collection API rate limit and drops rows silently.
-      const records = [];
-      for (let i = 0; i < keys.length; i += 8) {
-        const chunk = await Promise.all(
-          keys.slice(i, i + 8).map(async (key) => {
-            try { return await col.read(key); }
-            catch (e) { console.warn(`Read failed for ${key}:`, e); return null; }
-          })
-        );
-        records.push(...chunk);
-      }
-
-      const valid = records.filter((r) => r && r.sensor_version);
-      const failedCount = keys.length - valid.length;
-      const warnings = [];
-      if (failedCount > 0) warnings.push(`${failedCount} of ${keys.length} records failed to load`);
-      if (keys.length >= 500) warnings.push('showing first 500 records — collection may contain more');
-      setLoadWarning(warnings.length ? warnings.join('; ') : null);
-
-      setData(valid);
-      setLastUpdated(new Date());
-    } catch (err) {
-      console.error('Collection fetch error:', err);
-      setError('Unable to load sensor data. Make sure this is running inside the Falcon Console.');
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, [falcon]);
-
-  useEffect(() => {
-    if (falcon && isInitialized) fetchData();
-  }, [falcon, isInitialized, fetchData]);
-
-  // ── Export collection as JSON ──────────────────────────
-  // Foundry's sandboxed iframe blocks downloads AND popups.
-  // Copy to clipboard as the reliable fallback.
   const exportJson = useCallback(async () => {
-    const json = JSON.stringify(data, null, 2);
-
-    let ok = false;
-    try {
-      await navigator.clipboard.writeText(json);
-      ok = true;
-    } catch {
-      // Clipboard API is often blocked in sandboxed cross-origin iframes —
-      // fall back to the legacy execCommand path, which is not.
-      const ta = document.createElement('textarea');
-      ta.value = json;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try { ok = document.execCommand('copy'); } catch { ok = false; }
-      ta.remove();
-    }
-
+    const ok = await copyText(JSON.stringify(data, null, 2));
     setExportStatus(ok ? 'copied' : 'failed');
     setTimeout(() => setExportStatus('idle'), 3000);
   }, [data]);
 
-  // ── Sort handler ───────────────────────────────────────
   const handleSort = useCallback((key) => {
     setSortConfig((prev) => ({
       key,
@@ -442,6 +196,7 @@ function Home() {
 
   // ── Render helpers ─────────────────────────────────────
   const thBase = 'sticky top-0 z-10 bg-surface-inner py-3 px-5 font-medium text-body-and-labels uppercase tracking-wider text-xs cursor-pointer select-none hover:text-titles-and-attributes transition-colors border-b border-lines-dark';
+  const exportDisabled = data.length === 0 || exportStatus !== 'idle';
 
   // ── Render ─────────────────────────────────────────────
   return (
@@ -466,15 +221,15 @@ function Home() {
             )}
             <button
               onClick={exportJson}
-              disabled={data.length === 0 || exportStatus !== 'idle'}
-              className={`focusable interactive-normal rounded px-3 py-1.5 type-xs inline-flex items-center gap-2 ${data.length === 0 || exportStatus !== 'idle' ? 'interactive-disabled' : ''}`}
+              disabled={exportDisabled}
+              className={`focusable interactive-normal rounded px-3 py-1.5 type-xs inline-flex items-center gap-2 ${exportDisabled ? 'interactive-disabled' : ''}`}
               title="Copy collection JSON to clipboard"
             >
               {exportStatus === 'copied' ? <IconCheck /> : <IconCopy />}
               {exportStatus === 'copied' ? 'Copied to clipboard!' : exportStatus === 'failed' ? 'Copy failed' : 'Copy JSON'}
             </button>
             <button
-              onClick={() => fetchData(true)}
+              onClick={refresh}
               disabled={refreshing}
               className={`focusable interactive-normal rounded px-3 py-1.5 type-xs inline-flex items-center gap-2 ${refreshing ? 'interactive-disabled' : ''}`}
             >
@@ -510,7 +265,7 @@ function Home() {
               </div>
             </SlAlert>
             <button
-              onClick={() => fetchData()}
+              onClick={reload}
               className="focusable interactive-primary rounded px-4 py-2 type-sm mt-4"
             >
               Try Again
@@ -524,78 +279,15 @@ function Home() {
                 and wraps on narrow without depending on Toucan breakpoints. */}
             <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
               {Object.entries(PLATFORM).map(([key, meta]) => {
-                const stat = platformStats[key] || { count: 0 };
                 const isActive = platformFilter === key;
-                const trail = [['n-1', stat.n1], ['n-2', stat.n2]];
                 return (
-                  <div
+                  <PlatformCard
                     key={key}
-                    className={`bg-surface-md border rounded-lg p-5 cursor-pointer transition-colors hover:bg-surface-lg ${
-                      isActive ? 'border-border-reg' : 'border-border-faint'
-                    }`}
-                    style={isActive ? { boxShadow: '0 0 0 1px var(--informational)' } : {}}
-                    onClick={() => setPlatformFilter(isActive ? 'all' : key)}
-                    role="button"
-                    tabIndex={0}
-                    aria-pressed={isActive}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault(); // Space would scroll the page otherwise
-                        setPlatformFilter(isActive ? 'all' : key);
-                      }
-                    }}
-                  >
-                    {/* Header: platform · build count */}
-                    <div className="flex items-baseline gap-2 mb-3 min-w-0">
-                      <span className="type-sm font-semibold text-titles-and-attributes">{meta.label}</span>
-                      <span className="type-xs text-disabled tabular-nums whitespace-nowrap">
-                        {stat.count} build{stat.count !== 1 ? 's' : ''}
-                      </span>
-                    </div>
-
-                    {/* Hero: current N version */}
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <span className="w-1.5 h-1.5 rounded-full status-dot-current" style={{ backgroundColor: 'var(--informational)' }} />
-                      <span className="uppercase tracking-wider text-body-and-labels font-medium" style={{ fontSize: '0.6rem' }}>
-                        Current · N
-                      </span>
-                    </div>
-                    {stat.n ? (
-                      <div className="flex items-baseline gap-2 flex-wrap">
-                        <span className="type-sm-mono tabular-nums text-text-and-icons" style={{ fontSize: '1.5rem', lineHeight: 1.1 }}>
-                          {stat.n.sensor_version}
-                        </span>
-                        {stat.n_ea && (
-                          <span className="inline-flex items-baseline gap-1.5 text-body-and-labels">
-                            <span className="type-sm-mono tabular-nums">{stat.n_ea.sensor_version}</span>
-                            <StageBadge stage="early_adopter" />
-                          </span>
-                        )}
-                      </div>
-                    ) : (
-                      <span className="type-sm text-disabled italic">No current build</span>
-                    )}
-
-                    {/* Trail: N-1 / N-2 */}
-                    <div className="grid grid-cols-2 gap-3 mt-4 pt-3 border-t border-border-faint">
-                      {trail.map(([standing, record]) => {
-                        const smeta = STANDING[standing];
-                        return (
-                          <div key={standing}>
-                            <div className="flex items-center gap-1.5 mb-0.5">
-                              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: `var(${smeta.dotVar})` }} />
-                              <span className="type-xs text-body-and-labels font-medium">{smeta.label}</span>
-                            </div>
-                            {record ? (
-                              <span className="type-sm-mono tabular-nums text-titles-and-attributes">{record.sensor_version}</span>
-                            ) : (
-                              <span className="type-sm text-disabled italic">—</span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                    label={meta.label}
+                    stat={platformStats[key] || { count: 0 }}
+                    isActive={isActive}
+                    onToggle={() => setPlatformFilter(isActive ? 'all' : key)}
+                  />
                 );
               })}
             </div>
@@ -724,12 +416,8 @@ function Home() {
                         // stage disambiguates a build present in both prod and EA
                         const rowKey = `${row.platform}_${row.build_number}_${row.stage || i}`;
                         const isExpanded = expandedRows.has(rowKey);
-                        const history = Array.isArray(row.previous_standings) ? row.previous_standings : [];
-                        const cleanHistory = history.filter((entry, idx) => {
-                          if (idx === 0) return true;
-                          return entry.standing !== history[idx - 1].standing;
-                        });
-                        const hasHistory = cleanHistory.length > 0;
+                        const timeline = standingTimeline(row);
+                        const hasHistory = timeline.length > 1;
 
                         const mainRow = (
                           <tr key={rowKey} className={`border-b border-lines-dark hover:bg-surface-lg transition-colors${i % 2 === 1 ? ' bg-surface-inner' : ''}`}>
@@ -773,69 +461,11 @@ function Home() {
 
                         if (!isExpanded || !hasHistory) return [mainRow];
 
-                        const timeline = [
-                          ...cleanHistory.map((h) => ({ standing: h.standing, timestamp: h.timestamp, isCurrent: false })),
-                          { standing: row.release_standing, timestamp: row.standing_updated_timestamp || row.first_seen_timestamp, isCurrent: true },
-                        ];
-
                         const historyRow = (
                           <tr key={`${rowKey}-history`} className="border-b border-lines-dark bg-surface-inner">
                             <td />
                             <td colSpan="6" className="py-3 px-5 pb-4">
-                              <div className="type-xs text-body-and-labels mb-3 font-medium uppercase tracking-wider">Standing History</div>
-                              {/* Staircase: fills the full row width, steps descend top-left → bottom-right */}
-                              {(() => {
-                                const numSteps = Math.max(timeline.length - 1, 1);
-                                const maxPct = 65; // last step starts at 65% — leaves room for card content
-                                return (
-                                  <div className="flex flex-col">
-                                    {timeline.map((entry, idx) => {
-                                      const meta = STANDING[entry.standing] || STANDING.untagged;
-                                      const pct = (idx / numSteps) * maxPct;
-                                      const prevPct = ((idx - 1) / numSteps) * maxPct;
-                                      const stepPct = maxPct / numSteps;
-                                      return (
-                                        <div key={idx}>
-                                          {/* L-shaped connector (riser) */}
-                                          {idx > 0 && (
-                                            <div
-                                              style={{
-                                                marginLeft: `calc(${prevPct}% + 10px)`,
-                                                width: `calc(${stepPct}% - 10px)`,
-                                                height: '10px',
-                                                borderLeft: '1.5px solid var(--border-faint)',
-                                                borderBottom: '1.5px solid var(--border-faint)',
-                                                borderBottomLeftRadius: '4px',
-                                              }}
-                                            />
-                                          )}
-                                          {/* Step card */}
-                                          <div
-                                            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded bg-surface-md border ${
-                                              entry.isCurrent ? 'border-border-reg' : 'border-border-faint'
-                                            }`}
-                                            style={{ marginLeft: `${pct}%` }}
-                                          >
-                                            <span
-                                              className="w-2 h-2 rounded-full flex-shrink-0"
-                                              style={{ backgroundColor: `var(${meta.dotVar})`, opacity: entry.isCurrent ? 1 : 0.5 }}
-                                            />
-                                            <span className={`text-xs ${entry.isCurrent ? 'font-semibold text-titles-and-attributes' : 'font-medium text-body-and-labels'}`}>
-                                              {meta.label}
-                                              {entry.isCurrent && <span className="opacity-60 ml-1" style={{ fontSize: '0.6rem' }}>now</span>}
-                                            </span>
-                                            {entry.timestamp && (
-                                              <span className="type-xs text-disabled tabular-nums whitespace-nowrap">
-                                                {formatDate(entry.timestamp)}
-                                              </span>
-                                            )}
-                                          </div>
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                );
-                              })()}
+                              <StandingHistory timeline={timeline} />
                             </td>
                           </tr>
                         );

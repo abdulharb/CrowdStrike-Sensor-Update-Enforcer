@@ -21,15 +21,17 @@ flowchart TD
         F1_START["POST /update-sensor-tracker"] --> F1_FETCH["Fetch sensor builds per platform<br/>SensorUpdatePolicies.query_combined_builds()"]
         F1_FETCH --> F1_PARSE["Parse build strings<br/>Extract release_standing: n, n-1, n-2, untagged<br/>Extract build_number"]
         F1_PARSE --> F1_DEDUP["Check collection for existing entries"]
-        F1_DEDUP -->|New version at standing| F1_STORE["Store in collection<br/>first_seen_timestamp = now()"]
-        F1_DEDUP -->|Already exists| F1_SKIP["Skip"]
+        F1_DEDUP -->|New build| F1_STORE["Store in collection<br/>first_seen_timestamp = now()<br/>standing_updated_timestamp = now()"]
+        F1_DEDUP -->|Standing changed| F1_PROMOTE["Update record in place<br/>standing_updated_timestamp = now()<br/>append old standing to previous_standings"]
+        F1_DEDUP -->|Unchanged| F1_SKIP["Skip"]
     end
 
     F1_STORE --> COLLECTION
+    F1_PROMOTE --> COLLECTION
     F1_SKIP -.-> COLLECTION
 
     subgraph COLLECTION["Foundry Collection: sensor_release_tracker"]
-        COL_DATA["Example entry:<br/>platform: 'Windows'<br/>sensor_version: '7.14.20407'<br/>release_standing: 'n-2'<br/>build_number: '20407'<br/>first_seen_timestamp: 1711670400"]
+        COL_DATA["Example entry:<br/>platform: 'Windows'<br/>sensor_version: '7.14.20407'<br/>release_standing: 'n-2'<br/>build_number: '20407'<br/>first_seen_timestamp: 1709078400<br/>standing_updated_timestamp: 1711670400<br/>previous_standings: [n, n-1]"]
     end
 
     subgraph F2["Foundry Function: enforce-grace-period"]
@@ -43,7 +45,7 @@ flowchart TD
 
         COLLECTION -.->|read| F2_COLLECTION
 
-        F2_COLLECTION --> F2_RESULT["Now we know:<br/>Target version: 7.14.20407 (current n-2)<br/>First seen: 1711670400<br/>Grace period threshold: first_seen + 3 days"]
+        F2_COLLECTION --> F2_RESULT["Now we know:<br/>Target version: 7.14.20407 (current n-2)<br/>Promoted to n-2: 1711670400<br/>Grace period threshold: standing_updated + 3 days"]
 
         F2_RESULT --> PHASE_A
         F2_RESULT --> PHASE_B
@@ -55,10 +57,10 @@ flowchart TD
         end
 
         subgraph PHASE_B["Phase B: Enforcement (if grace period expired)"]
-            B0{"now - first_seen_timestamp<br/>>= GRACE_PERIOD_DAYS * 86400?"}
+            B0{"now - standing_updated_timestamp<br/>>= GRACE_PERIOD_DAYS * 86400?"}
             B0 -->|"No: grace period active<br/>(normal policy still has time)"| B_SKIP["Skip - let maintenance<br/>window handle it"]
             B0 -->|"Yes: grace period expired<br/>(host missed its window)"| B1["Get members of SOURCE group<br/>filtered by platform"]
-            B1 --> B2["For each member:<br/>- Skip if already in FORCE group<br/>- Skip if already at target version"]
+            B1 --> B2["For each member:<br/>- Skip if already in FORCE group<br/>- Skip if agent_version missing/unparseable<br/>- Skip if already at target version"]
             B2 --> B3["Add stale hosts to FORCE group<br/>in batches of 500"]
         end
     end
@@ -114,7 +116,7 @@ flowchart TD
 |-----------|------|---------|
 | `update-sensor-tracker` | Foundry Function (Python) | Polls sensor builds API, tracks version standings in collection |
 | `enforce-grace-period` | Foundry Function (Python) | Manages force-group membership based on grace period |
-| `sensor_release_tracker` | Foundry Collection | Stores version records with `first_seen_timestamp` for grace period math |
+| `sensor_release_tracker` | Foundry Collection | One record per build: `first_seen_timestamp`, current standing, `standing_updated_timestamp` (grace period anchor), `previous_standings` |
 | Sensor Update Enforcer - Scheduled | Foundry Workflow (bundled, provisions on install) | Every 4 hours: tracker, 10-minute sleep, then enforcement |
 | Sensor Release Tracker | Foundry UI Page (React + Vite) | App homepage; dashboard of release standings and update history from the collection |
 
