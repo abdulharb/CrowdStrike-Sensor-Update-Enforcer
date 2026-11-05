@@ -15,9 +15,10 @@ Runs in two phases:
 
 import json
 import os
+import re
 import time
 from logging import Logger
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from crowdstrike.foundry.function import Function, Request, Response, APIError
 from falconpy import CustomStorage, HostGroup, SensorUpdatePolicies
@@ -26,32 +27,32 @@ FUNC = Function.instance()
 
 COLLECTION_NAME = "sensor_release_tracker"
 
-# Maps collection platform names to device API platform_name values
+# Maps collection/request platform keys to device API platform_name values
 PLATFORM_FQL_MAP = {
     "windows": "Windows",
     "mac": "Mac",
     "linux": "Linux",
 }
-
-# Reverse mapping for cleanup/policy detection
 FQL_TO_COLLECTION_MAP = {v: k for k, v in PLATFORM_FQL_MAP.items()}
+VALID_PLATFORMS = set(PLATFORM_FQL_MAP)
 
-VALID_PLATFORMS = set(PLATFORM_FQL_MAP.keys())
+DEFAULT_GRACE_PERIOD_DAYS = 3
+MAX_GRACE_PERIOD_DAYS = 90
 
 # Max device IDs per perform_group_action call
 BATCH_SIZE = 500
 
-# Max results per device/host-group query page
+# Max results per policy / host-group query page (the API maximum)
 PAGE_LIMIT = 5000
 
 
 # ---------------------------------------------------------------------------
-# Helpers (same patterns as update-sensor-tracker)
+# Helpers (copied in update-sensor-tracker: Foundry functions can't share
+# modules, so keep the two copies in sync)
 # ---------------------------------------------------------------------------
 
 def is_debug_mode() -> bool:
-    debug_value = os.environ.get("DEBUG_MODE", "").lower()
-    return debug_value in ("true", "1", "yes")
+    return os.environ.get("DEBUG_MODE", "").lower() in ("true", "1", "yes")
 
 
 def log_debug(logger: Logger, message: str) -> None:
@@ -60,10 +61,37 @@ def log_debug(logger: Logger, message: str) -> None:
 
 
 def get_headers() -> Dict[str, str]:
-    headers = {}
-    if os.environ.get("APP_ID"):
-        headers = {"X-CS-APP-ID": os.environ.get("APP_ID")}
-    return headers
+    app_id = os.environ.get("APP_ID")
+    return {"X-CS-APP-ID": app_id} if app_id else {}
+
+
+def response_body(response: Any) -> Dict[str, Any]:
+    """The response body as a dict; falconpy can return body=None on errors."""
+    body = response.get("body") if isinstance(response, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
+def extract_error_message(response: Any) -> str:
+    """Pull a human-readable message from a falconpy response's body.errors."""
+    errors = response_body(response).get("errors")
+    if isinstance(errors, list):
+        msgs = [e["message"] for e in errors if isinstance(e, dict) and e.get("message")]
+        if msgs:
+            return "; ".join(msgs)
+    return "Unknown error"
+
+
+def error_response(code: int, message: str) -> Response:
+    return Response(code=code, errors=[APIError(code=code, message=message)])
+
+
+class FalconAPIError(Exception):
+    """A Falcon API call failed. Carries the API's own status and message."""
+
+    def __init__(self, operation: str, response: Any):
+        status = response.get("status_code") if isinstance(response, dict) else None
+        self.status_code = status if isinstance(status, int) and status >= 400 else 500
+        super().__init__(f"{operation} failed ({status}): {extract_error_message(response)}")
 
 
 def parse_build_string(build_string: str) -> Dict[str, str]:
@@ -75,110 +103,114 @@ def parse_build_string(build_string: str) -> Dict[str, str]:
     - "20503|n|tagged|18"  -> build_number: 20503, release_standing: n
     - "20103" (untagged)   -> build_number: 20103, release_standing: untagged
     """
-    if "|" in build_string:
-        parts = build_string.split("|")
-        build_number = parts[0]
-        release_standing = parts[1] if len(parts) > 1 else "untagged"
-    else:
-        build_number = build_string
-        release_standing = "untagged"
+    parts = (build_string or "").split("|")
+    standing = parts[1] if len(parts) > 1 and parts[1] else "untagged"
+    return {"build_number": parts[0], "release_standing": standing}
 
-    return {
-        "build_number": build_number,
-        "release_standing": release_standing,
-    }
+
+def paginate(
+    query: Callable[..., Dict[str, Any]],
+    operation: str,
+    logger: Logger,
+    **params: Any,
+) -> List[Dict[str, Any]]:
+    """Collect every page of an offset-paginated Falcon query.
+
+    Raises FalconAPIError on the first failed page instead of returning a
+    partial list that would look like a complete one.
+    """
+    items: List[Dict[str, Any]] = []
+    while True:
+        log_debug(logger, f"{operation}: offset={len(items)}")
+        resp = query(limit=PAGE_LIMIT, offset=len(items), **params)
+        if resp.get("status_code") != 200:
+            raise FalconAPIError(operation, resp)
+        body = response_body(resp)
+        page = body.get("resources") or []
+        items.extend(page)
+        total = ((body.get("meta") or {}).get("pagination") or {}).get("total", 0)
+        if not page or len(items) >= total:
+            return items
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-def load_config(body: Dict[str, Any], logger: Logger) -> Tuple[Optional[Dict[str, Any]], Optional[Response]]:
+def _parse_grace_days(value: Any, source: str) -> int:
+    invalid = f"{source} must be an integer between 0 and {MAX_GRACE_PERIOD_DAYS} (got {value!r})"
+    if isinstance(value, bool):
+        raise ValueError(invalid)
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(invalid) from None
+    # Negative grace would mean "enforce immediately", which is never intended.
+    if not 0 <= days <= MAX_GRACE_PERIOD_DAYS:
+        raise ValueError(invalid)
+    return days
+
+
+def _parse_platforms(value: Any, source: str) -> List[str]:
+    if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+        raise ValueError(f'{source} must be a list of platform names (e.g. ["windows", "mac", "linux"])')
+    # Normalize and de-duplicate, keeping order.
+    platforms = list(dict.fromkeys(p.strip().lower() for p in value if p.strip()))
+    invalid = [p for p in platforms if p not in VALID_PLATFORMS]
+    if invalid:
+        raise ValueError(f"Invalid platform(s) in {source}: {invalid}. Allowed: {sorted(VALID_PLATFORMS)}")
+    return platforms
+
+
+def load_config(body: Dict[str, Any], logger: Logger) -> Dict[str, Any]:
     """
     Load configuration from env vars with optional request body overrides.
 
-    Returns (config_dict, error_response).
+    Raises ValueError (returned to the caller as a 400) on any missing or
+    invalid setting -- this function moves hosts between groups, so it never
+    guesses at a misconfigured value.
     """
     source_group_id = os.environ.get("SOURCE_GROUP_ID", "").strip()
     if not source_group_id:
-        return None, Response(
-            code=400,
-            errors=[APIError(
-                code=400,
-                message="SOURCE_GROUP_ID environment variable is not set. "
-                        "Set it to the host group ID for the normal maintenance-window policy."
-            )]
-        )
+        raise ValueError("SOURCE_GROUP_ID environment variable is not set. "
+                         "Set it to the host group ID for the normal maintenance-window policy.")
 
     force_group_id = os.environ.get("FORCE_UPDATE_GROUP_ID", "").strip()
     if not force_group_id:
-        return None, Response(
-            code=400,
-            errors=[APIError(
-                code=400,
-                message="FORCE_UPDATE_GROUP_ID environment variable is not set. "
-                        "Set it to the host group ID for force updates."
-            )]
-        )
+        raise ValueError("FORCE_UPDATE_GROUP_ID environment variable is not set. "
+                         "Set it to the host group ID for force updates.")
 
-    # Grace period: env var default, request body override
-    try:
-        grace_period_days = int(os.environ.get("GRACE_PERIOD_DAYS", "3"))
-    except ValueError:
-        grace_period_days = 3
+    # Cleanup removes hosts from the force group; if it were the source group,
+    # every up-to-date host would be pulled out of its normal group.
+    if source_group_id == force_group_id:
+        raise ValueError("SOURCE_GROUP_ID and FORCE_UPDATE_GROUP_ID must be different host groups")
 
     if "grace_period_days" in body:
-        try:
-            grace_period_days = int(body["grace_period_days"])
-        except (ValueError, TypeError):
-            return None, Response(
-                code=400,
-                errors=[APIError(
-                    code=400,
-                    message="grace_period_days must be a number (0-90)"
-                )]
-            )
+        grace_period_days = _parse_grace_days(body["grace_period_days"], "grace_period_days")
+    else:
+        env_grace = os.environ.get("GRACE_PERIOD_DAYS", "").strip() or DEFAULT_GRACE_PERIOD_DAYS
+        grace_period_days = _parse_grace_days(env_grace, "GRACE_PERIOD_DAYS")
 
-    # Covers both the env default and the body override. Negative grace would
-    # mean "enforce immediately", which is never intended.
-    if not 0 <= grace_period_days <= 90:
-        return None, Response(
-            code=400,
-            errors=[APIError(
-                code=400,
-                message=f"grace_period_days must be between 0 and 90 (got {grace_period_days})"
-            )]
-        )
-
-    # Platforms: env var default, request body override
-    platforms = [p.strip() for p in os.environ.get("PLATFORMS", "windows").split(",") if p.strip()]
     if "platforms" in body:
-        if not isinstance(body["platforms"], list):
-            return None, Response(
-                code=400,
-                errors=[APIError(
-                    code=400,
-                    message="platforms must be an array of strings (e.g. [\"windows\", \"mac\", \"linux\"])"
-                )]
-            )
-        platforms = body["platforms"]
-
-    invalid = [p for p in platforms if p not in VALID_PLATFORMS]
-    if invalid:
-        return None, Response(
-            code=400,
-            errors=[APIError(
-                code=400,
-                message=f"Invalid platform(s): {invalid}. Allowed: {sorted(VALID_PLATFORMS)}"
-            )]
-        )
+        platforms = _parse_platforms(body["platforms"], "platforms")
+    else:
+        platforms = _parse_platforms(os.environ.get("PLATFORMS", "windows").split(","), "PLATFORMS")
 
     # Optional manual override for target standing (auto-detected from policy if empty)
-    target_standing_override = os.environ.get("TARGET_STANDING", "").strip() or None
+    target_standing_override = os.environ.get("TARGET_STANDING", "").strip().lower() or None
+    if target_standing_override and not re.fullmatch(r"n(-\d+)?", target_standing_override):
+        raise ValueError(f"TARGET_STANDING must look like 'n', 'n-1' or 'n-2' "
+                         f"(got {target_standing_override!r})")
 
     dry_run = body.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise ValueError(f"dry_run must be true or false (got {dry_run!r})")
 
-    config = {
+    logger.info(f"Config: grace_period_days={grace_period_days}, platforms={platforms}, "
+                f"dry_run={dry_run}, source_group={source_group_id[:8]}..., "
+                f"force_group={force_group_id[:8]}..., "
+                f"target_standing_override={target_standing_override}")
+    return {
         "source_group_id": source_group_id,
         "force_group_id": force_group_id,
         "grace_period_days": grace_period_days,
@@ -186,11 +218,6 @@ def load_config(body: Dict[str, Any], logger: Logger) -> Tuple[Optional[Dict[str
         "target_standing_override": target_standing_override,
         "dry_run": dry_run,
     }
-    logger.info(f"Config: grace_period_days={grace_period_days}, platforms={platforms}, "
-                f"dry_run={dry_run}, source_group={source_group_id[:8]}..., "
-                f"force_group={force_group_id[:8]}..., "
-                f"target_standing_override={target_standing_override}")
-    return config, None
 
 
 # ---------------------------------------------------------------------------
@@ -216,52 +243,22 @@ def is_current(agent_version: str, target_version: str) -> bool:
     return parse_version(agent_version) >= parse_version(target_version)
 
 
-def has_known_version(agent_version: str) -> bool:
-    """True only if the host reported a parseable, non-empty sensor version.
+def has_known_version(version: str) -> bool:
+    """True only for a parseable, non-empty sensor version.
 
     Hosts with a missing or garbage agent_version are NOT enforced: forcing an
     update off absent data risks disrupting hosts whose version simply wasn't
     reported (e.g. long-offline devices with stale records). Such hosts are
     logged and skipped rather than added to the force group.
     """
-    if not agent_version or not agent_version.strip():
+    if not version or not version.strip():
         return False
-    return parse_version(agent_version) != (0, 0, 0)
+    return parse_version(version) != (0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
 # Source policy detection
 # ---------------------------------------------------------------------------
-
-def _fetch_all_policies(
-    falcon_sensor: SensorUpdatePolicies,
-    logger: Logger
-) -> List[Dict[str, Any]]:
-    """Paginate through all sensor update policies."""
-    all_policies = []
-    offset = 0
-    limit = 200
-    while True:
-        log_debug(logger, f"Querying sensor update policies offset={offset}")
-        resp = falcon_sensor.query_combined_policies_v2(limit=limit, offset=offset)
-        if resp.get("status_code") != 200:
-            logger.error(f"Failed to query sensor update policies: {resp.get('status_code')} "
-                         f"{resp.get('body', {}).get('errors', [])}")
-            break
-
-        resources = resp.get("body", {}).get("resources", [])
-        if not resources:
-            break
-        all_policies.extend(resources)
-
-        total = resp.get("body", {}).get("meta", {}).get("pagination", {}).get("total", 0)
-        offset += limit
-        if offset >= total:
-            break
-
-    logger.info(f"Fetched {len(all_policies)} sensor update policies")
-    return all_policies
-
 
 def get_source_policy_targets(
     falcon_sensor: SensorUpdatePolicies,
@@ -270,76 +267,59 @@ def get_source_policy_targets(
     logger: Logger
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Query sensor update policies to find those attached to the source host group.
-    Extracts the target standing per platform from each matching policy.
+    Find the sensor update policy that governs the source host group on each
+    platform, and the release standing it targets.
 
-    If multiple policies match the same platform, the one with the highest
-    precedence (lowest precedence number) wins -- matching CrowdStrike's
-    actual policy evaluation order.
+    Policies are requested in precedence order (highest priority first), so
+    the first enabled policy attached to the source group for a platform is
+    the one its hosts actually receive. If that policy is pinned to a specific
+    build (no release standing), the platform is skipped rather than falling
+    back to a lower-precedence policy the hosts don't get. TARGET_STANDING
+    overrides the standing for every platform.
 
     Returns: {platform_key: {"target_standing": str, "policy_name": str, ...}}
+    Raises FalconAPIError if the policy query fails.
     """
-    targets = {}
+    policies = paginate(falcon_sensor.query_combined_policies_v2,
+                        "Query sensor update policies", logger, sort="precedence.asc")
+    logger.info(f"Fetched {len(policies)} sensor update policies")
 
-    logger.info("Querying sensor update policies to detect source group targets")
-    all_policies = _fetch_all_policies(falcon_sensor, logger)
-
-    for policy in all_policies:
-        # Check if this policy is attached to our source group
-        groups = policy.get("groups", [])
-        group_ids = [g.get("id") for g in groups]
+    targets: Dict[str, Dict[str, Any]] = {}
+    seen_platforms: Set[str] = set()
+    for policy in policies:
+        group_ids = {g.get("id") for g in policy.get("groups") or [] if isinstance(g, dict)}
         if source_group_id not in group_ids:
             continue
 
-        # This policy is attached to the source group
+        policy_name = policy.get("name", "")
         platform_name = policy.get("platform_name", "")
         platform_key = FQL_TO_COLLECTION_MAP.get(platform_name, platform_name.lower())
-        policy_name = policy.get("name", "")
-        precedence = policy.get("precedence", 9999)
 
-        settings = policy.get("settings", {})
+        # CrowdStrike ignores disabled policies, so do we.
+        if policy.get("enabled") is False:
+            logger.info(f"{platform_key}: ignoring disabled policy '{policy_name}'")
+            continue
+        if platform_key in seen_platforms:
+            log_debug(logger, f"{platform_key}: ignoring lower-precedence policy '{policy_name}'")
+            continue
+        seen_platforms.add(platform_key)
+
+        settings = policy.get("settings") or {}
         build_str = settings.get("build", "")
         sensor_version = settings.get("sensor_version", "")
 
-        # Determine target standing
         if target_standing_override:
             standing = target_standing_override
-            logger.info(f"{platform_key}: Using TARGET_STANDING override: '{standing}'")
+            logger.info(f"{platform_key}: using TARGET_STANDING override '{standing}'")
         else:
-            build_info = parse_build_string(build_str)
-            standing = build_info.get("release_standing", "")
-            log_debug(logger, f"{platform_key}: Parsed build string '{build_str}' -> "
-                      f"standing='{standing}'")
+            standing = parse_build_string(build_str)["release_standing"]
+            log_debug(logger, f"{platform_key}: parsed build string '{build_str}' -> '{standing}'")
 
-        # Validate BEFORE the precedence decision so an untagged/pinned policy
-        # never logs "Replacing" and then silently keeps the old target.
-        if not standing or standing == "untagged":
-            kept = ""
-            if platform_key in targets:
-                kept = (f" Keeping existing target from policy "
-                        f"'{targets[platform_key]['policy_name']}'.")
-            logger.warning(f"{platform_key}: Could not determine target standing from "
-                           f"policy '{policy_name}' (build='{build_str}'). "
-                           f"Set TARGET_STANDING env var to override.{kept}")
+        if standing == "untagged":
+            logger.warning(f"{platform_key}: policy '{policy_name}' is pinned to build "
+                           f"'{build_str}' with no release standing - skipping this platform. "
+                           f"Set the TARGET_STANDING env var to enforce a standing anyway.")
             continue
-
-        # If we already have a match for this platform, keep the higher-precedence
-        # one (lower number = higher priority, matching CrowdStrike evaluation
-        # order). Note: the live API omits 'precedence', so in practice both
-        # default to 9999 and the first policy returned wins.
-        if platform_key in targets:
-            existing_precedence = targets[platform_key].get("precedence", 9999)
-            if precedence >= existing_precedence:
-                log_debug(logger, f"{platform_key}: Skipping policy '{policy_name}' "
-                          f"(precedence {precedence}) - already have higher-precedence "
-                          f"policy '{targets[platform_key]['policy_name']}' "
-                          f"(precedence {existing_precedence})")
-                continue
-            else:
-                logger.info(f"{platform_key}: Replacing policy "
-                            f"'{targets[platform_key]['policy_name']}' "
-                            f"(precedence {existing_precedence}) with "
-                            f"'{policy_name}' (precedence {precedence})")
 
         targets[platform_key] = {
             "policy_id": policy.get("id", ""),
@@ -347,16 +327,12 @@ def get_source_policy_targets(
             "target_standing": standing,
             "policy_sensor_version": sensor_version,
             "policy_build_string": build_str,
-            "precedence": precedence,
         }
-        logger.info(f"{platform_key}: Policy '{policy_name}' (precedence {precedence}) "
-                    f"targets standing '{standing}' "
+        logger.info(f"{platform_key}: policy '{policy_name}' targets standing '{standing}' "
                     f"(build={build_str}, version={sensor_version})")
 
     if not targets:
-        logger.error(f"No sensor update policies found attached to source group "
-                     f"{source_group_id}")
-
+        logger.error(f"No usable sensor update policy found for source group {source_group_id}")
     return targets
 
 
@@ -364,161 +340,177 @@ def get_source_policy_targets(
 # Collection queries
 # ---------------------------------------------------------------------------
 
+def read_record(storage: CustomStorage, object_key: str) -> Dict[str, Any]:
+    """Read a full collection record. GetObject returns raw bytes on success."""
+    resp = storage.GetObject(collection_name=COLLECTION_NAME, object_key=object_key)
+    if isinstance(resp, (bytes, bytearray)):
+        return json.loads(resp.decode("utf-8"))
+    body = response_body(resp)
+    if isinstance(resp, dict) and resp.get("status_code") == 200 and "sensor_version" in body:
+        return body
+    raise FalconAPIError(f"Collection read of {object_key}", resp)
+
+
 def get_target_versions(
     storage: CustomStorage,
     policy_targets: Dict[str, Dict[str, Any]],
     logger: Logger
-) -> Dict[str, Dict[str, Any]]:
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, str]]]:
     """
-    For each platform, look up the current build at the policy's target standing
-    in the collection.
+    For each platform, look up the current build at the policy's target
+    standing in the collection.
 
-    Returns: {platform: {"sensor_version": str, "first_seen_timestamp": int,
-                          "target_standing": str, "policy_name": str}}
+    Returns (target_versions, errors), where target_versions is
+    {platform: {"sensor_version", "first_seen_timestamp",
+                "standing_updated_timestamp", "target_standing", "policy_name"}}
     """
-    target_versions = {}
+    target_versions: Dict[str, Dict[str, Any]] = {}
+    errors: List[Dict[str, str]] = []
 
     for platform, target_info in policy_targets.items():
         standing = target_info["target_standing"]
+        # The tracker stores the builds API's capitalized platform name ("Windows").
+        platform_fql = PLATFORM_FQL_MAP.get(platform, platform)
         log_debug(logger, f"Querying collection for current '{standing}' build on {platform}")
 
-        # The sensor builds API stores capitalized platform names (e.g. "Windows").
-        # Use PLATFORM_FQL_MAP to match the stored value.
-        platform_fql = PLATFORM_FQL_MAP.get(platform, platform)
+        try:
+            resp = storage.SearchObjects(
+                filter=f"platform:'{platform_fql}'+release_standing:'{standing}'",
+                sort="first_seen_timestamp|desc",
+                collection_name=COLLECTION_NAME,
+                limit=1,
+            )
+            if resp.get("status_code") != 200:
+                raise FalconAPIError(f"Collection search for {platform}/{standing}", resp)
 
-        resp = storage.SearchObjects(
-            filter=f"platform:'{platform_fql}'+release_standing:'{standing}'",
-            sort="first_seen_timestamp|desc",
-            collection_name=COLLECTION_NAME,
-            limit=1,
-        )
-
-        if resp.get("status_code") == 200:
-            resources = resp.get("body", {}).get("resources", [])
-            if resources:
-                entry = resources[0]
-
-                # SearchObjects may return only metadata (object_key) when
-                # called outside the Foundry runtime. If the full record body
-                # is missing, fetch it with GetObject.
-                if "sensor_version" not in entry and "object_key" in entry:
-                    log_debug(logger, f"SearchObjects returned key only — "
-                              f"fetching full record: {entry['object_key']}")
-                    get_resp = storage.GetObject(
-                        collection_name=COLLECTION_NAME,
-                        object_key=entry["object_key"],
-                    )
-                    if isinstance(get_resp, bytes):
-                        entry = json.loads(get_resp.decode("utf-8"))
-                    elif isinstance(get_resp, dict) and get_resp.get("status_code") == 200:
-                        body = get_resp.get("body", {})
-                        if isinstance(body, dict) and "sensor_version" in body:
-                            entry = body
-
-                # Grace is measured from when the build REACHED the target
-                # standing (its promotion) -- standing_updated_timestamp -- not
-                # when it first appeared (which, for an n-1/n-2 target, predates
-                # the promotion by weeks and would make grace a no-op). Do NOT
-                # fall back to first_seen: legacy records without this field have
-                # no reliable promotion date, and anchoring to first_seen would
-                # make grace expire instantly. promoted_at==0 is handled below by
-                # skipping enforcement until update-sensor-tracker re-stamps it.
-                first_seen = entry.get("first_seen_timestamp", 0)
-                promoted_at = entry.get("standing_updated_timestamp", 0)
-                target_versions[platform] = {
-                    "sensor_version": entry.get("sensor_version", ""),
-                    "first_seen_timestamp": first_seen,
-                    "standing_updated_timestamp": promoted_at,
-                    "target_standing": standing,
-                    "policy_name": target_info.get("policy_name", ""),
-                }
-                logger.info(f"{platform}: Current '{standing}' is version "
-                            f"{target_versions[platform]['sensor_version']} "
-                            f"(promoted: {promoted_at}, first seen: {first_seen})")
-            else:
+            resources = response_body(resp).get("resources") or []
+            if not resources:
                 logger.warning(f"{platform}: No '{standing}' version found in collection. "
                                f"Has update-sensor-tracker run?")
-        else:
-            logger.error(f"Failed to query collection for {platform}/{standing}: "
-                         f"{resp.get('status_code')}")
+                continue
 
-    return target_versions
+            entry = resources[0]
+            # SearchObjects may return only metadata (object_key); if so,
+            # fetch the full record.
+            if "sensor_version" not in entry:
+                log_debug(logger, f"SearchObjects returned metadata only - "
+                          f"fetching full record: {entry.get('object_key')}")
+                entry = read_record(storage, entry.get("object_key", ""))
+        except FalconAPIError as e:
+            logger.error(str(e))
+            errors.append({"operation": "collection-lookup", "error": str(e)})
+            continue
+
+        # Grace is measured from when the build REACHED the target standing
+        # (its promotion) -- standing_updated_timestamp -- not when it first
+        # appeared (which, for an n-1/n-2 target, predates the promotion by
+        # weeks and would make grace a no-op). Do NOT fall back to first_seen:
+        # legacy records without this field have no reliable promotion date,
+        # and anchoring to first_seen would make grace expire instantly.
+        # promoted_at==0 makes Phase B skip the platform until
+        # update-sensor-tracker re-stamps it.
+        first_seen = entry.get("first_seen_timestamp", 0)
+        promoted_at = entry.get("standing_updated_timestamp", 0)
+        target_versions[platform] = {
+            "sensor_version": entry.get("sensor_version", ""),
+            "first_seen_timestamp": first_seen,
+            "standing_updated_timestamp": promoted_at,
+            "target_standing": standing,
+            "policy_name": target_info.get("policy_name", ""),
+        }
+        logger.info(f"{platform}: Current '{standing}' is version "
+                    f"{target_versions[platform]['sensor_version']} "
+                    f"(promoted: {promoted_at}, first seen: {first_seen})")
+
+    return target_versions, errors
+
+
+def get_cleanup_targets(
+    policy_targets: Dict[str, Dict[str, Any]],
+    target_versions: Dict[str, Dict[str, Any]],
+    logger: Logger
+) -> Dict[str, Dict[str, Any]]:
+    """Phase A targets: the collection's build when known, otherwise the
+    policy's own sensor_version, so cleanup still runs when the collection is
+    empty or stale."""
+    cleanup_targets = {}
+    for platform, target_info in policy_targets.items():
+        if platform in target_versions:
+            cleanup_targets[platform] = target_versions[platform]
+        elif target_info.get("policy_sensor_version"):
+            cleanup_targets[platform] = {"sensor_version": target_info["policy_sensor_version"]}
+            logger.warning(f"{platform}: Collection has no data for standing "
+                           f"'{target_info['target_standing']}'. Using policy "
+                           f"sensor_version '{target_info['policy_sensor_version']}' "
+                           f"as fallback for cleanup.")
+    return cleanup_targets
 
 
 # ---------------------------------------------------------------------------
-# Phase A: Cleanup
+# Host groups
 # ---------------------------------------------------------------------------
 
 def get_group_members(
     falcon_hg: HostGroup,
     group_id: str,
     logger: Logger,
-    label: str = "group"
+    label: str = "group",
+    fql_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Paginate through all members of a host group with full device details."""
-    all_members = []
-    offset = 0
-    while True:
-        log_debug(logger, f"Querying {label} members offset={offset}")
-        resp = falcon_hg.query_combined_group_members(
-            id=group_id, limit=PAGE_LIMIT, offset=offset
-        )
-        if resp.get("status_code") != 200:
-            logger.error(f"Failed to query {label} members: {resp.get('status_code')} "
-                         f"{resp.get('body', {}).get('errors', [])}")
-            break
-
-        resources = resp.get("body", {}).get("resources", [])
-        if not resources:
-            break
-        all_members.extend(resources)
-
-        total = resp.get("body", {}).get("meta", {}).get("pagination", {}).get("total", 0)
-        offset += PAGE_LIMIT
-        if offset >= total:
-            break
-
-    logger.info(f"{label} has {len(all_members)} members")
-    return all_members
+    """All members of a host group with device details. Raises FalconAPIError."""
+    params: Dict[str, Any] = {"id": group_id}
+    if fql_filter:
+        params["filter"] = fql_filter
+    members = paginate(falcon_hg.query_combined_group_members,
+                       f"Query {label} members", logger, **params)
+    logger.info(f"{label} has {len(members)} members")
+    return members
 
 
-def find_hosts_to_cleanup(
-    members: List[Dict[str, Any]],
-    target_versions: Dict[str, Dict[str, Any]],
+def batch_modify_group(
+    falcon_hg: HostGroup,
+    group_id: str,
+    device_ids: List[str],
+    action: str,
+    dry_run: bool,
     logger: Logger
-) -> List[Dict[str, Any]]:
-    """Identify force-group members whose sensor version now meets the source policy target."""
-    # An unparseable target ((0,0,0)) would make every host "current" and empty
-    # the force group in one run. Skip cleanup for that platform instead.
-    usable = {}
-    for platform_key, info in target_versions.items():
-        if parse_version(info.get("sensor_version", "")) == (0, 0, 0):
-            logger.warning(f"{platform_key}: target version "
-                           f"{info.get('sensor_version', '')!r} is unparseable - "
-                           f"skipping cleanup for this platform")
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    Add or remove hosts from a host group in batches.
+
+    action: "add-hosts" or "remove-hosts"
+    Returns (device_ids_modified, errors). In a dry run every ID counts as
+    modified and no call is made.
+    """
+    if not device_ids:
+        return [], []
+    if dry_run:
+        logger.info(f"[DRY RUN] Would {action} {len(device_ids)} hosts")
+        return list(device_ids), []
+
+    modified: List[str] = []
+    errors: List[Dict[str, str]] = []
+    for i in range(0, len(device_ids), BATCH_SIZE):
+        batch = device_ids[i:i + BATCH_SIZE]
+        id_filter = ",".join(f"'{did}'" for did in batch)
+        log_debug(logger, f"{action} batch {i // BATCH_SIZE + 1}: {len(batch)} hosts")
+        resp = falcon_hg.perform_group_action(
+            action_name=action,
+            body={
+                "ids": [group_id],
+                "action_parameters": [{"name": "filter", "value": f"(device_id:[{id_filter}])"}],
+            },
+        )
+        if resp.get("status_code") == 200:
+            modified.extend(batch)
         else:
-            usable[platform_key] = info
-    target_versions = usable
+            message = (f"Batch at offset {i} ({len(batch)} hosts) failed "
+                       f"({resp.get('status_code')}): {extract_error_message(resp)}")
+            errors.append({"operation": action, "error": message})
+            logger.error(f"{action}: {message}")
 
-    to_remove = []
-    for device in members:
-        platform_name = device.get("platform_name", "")
-        platform_key = FQL_TO_COLLECTION_MAP.get(platform_name)
-        if not platform_key or platform_key not in target_versions:
-            log_debug(logger, f"Skipping {device.get('hostname', '?')} - "
-                      f"platform '{platform_name}' not tracked")
-            continue
-
-        target = target_versions[platform_key]["sensor_version"]
-        agent_ver = device.get("agent_version", "")
-
-        if is_current(agent_ver, target):
-            to_remove.append(device)
-            log_debug(logger, f"Cleanup candidate: {device.get('hostname', '?')} "
-                      f"({agent_ver} >= {target})")
-
-    logger.info(f"Found {len(to_remove)} hosts to remove from force group (now at baseline)")
-    return to_remove
+    logger.info(f"{action}: {len(modified)}/{len(device_ids)} succeeded")
+    return modified, errors
 
 
 def _host_summary(device: Dict[str, Any]) -> Dict[str, str]:
@@ -531,132 +523,259 @@ def _host_summary(device: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-def batch_modify_group(
-    falcon_hg: HostGroup,
-    group_id: str,
-    device_ids: List[str],
-    action: str,
-    dry_run: bool,
+# ---------------------------------------------------------------------------
+# Phase A: Cleanup
+# ---------------------------------------------------------------------------
+
+def find_hosts_to_cleanup(
+    members: List[Dict[str, Any]],
+    target_versions: Dict[str, Dict[str, Any]],
     logger: Logger
-) -> Tuple[int, List[Dict[str, Any]]]:
-    """
-    Add or remove hosts from a host group in batches.
-
-    action: "add-hosts" or "remove-hosts"
-    Returns (count_modified, errors).
-    """
-    if not device_ids:
-        return 0, []
-    if dry_run:
-        logger.info(f"[DRY RUN] Would {action} {len(device_ids)} hosts")
-        return len(device_ids), []
-
-    errors = []
-    modified = 0
-
-    for i in range(0, len(device_ids), BATCH_SIZE):
-        batch = device_ids[i:i + BATCH_SIZE]
-        id_filter = ",".join(f"'{did}'" for did in batch)
-        filter_str = f"(device_id:[{id_filter}])"
-
-        log_debug(logger, f"{action} batch {i // BATCH_SIZE + 1}: {len(batch)} hosts")
-        resp = falcon_hg.perform_group_action(
-            action_name=action,
-            body={
-                "ids": [group_id],
-                "action_parameters": [
-                    {"name": "filter", "value": filter_str}
-                ]
-            }
-        )
-
-        if resp.get("status_code") == 200:
-            modified += len(batch)
+) -> List[Dict[str, Any]]:
+    """Identify force-group members whose sensor version now meets the source policy target."""
+    # An unparseable target ((0,0,0)) would make every host "current" and empty
+    # the force group in one run. Skip cleanup for that platform instead.
+    usable = {}
+    for platform_key, info in target_versions.items():
+        if has_known_version(info.get("sensor_version", "")):
+            usable[platform_key] = info["sensor_version"]
         else:
-            err_detail = resp.get("body", {}).get("errors", resp.get("body", {}))
-            errors.append({
-                "operation": action,
-                "error": f"Batch at offset {i} failed: {err_detail}"
-            })
-            logger.error(f"{action} batch failed: {err_detail}")
+            logger.warning(f"{platform_key}: target version "
+                           f"{info.get('sensor_version', '')!r} is unparseable - "
+                           f"skipping cleanup for this platform")
 
-    logger.info(f"{action}: {modified}/{len(device_ids)} succeeded")
-    return modified, errors
+    to_remove = []
+    for device in members:
+        platform_name = device.get("platform_name", "")
+        target = usable.get(FQL_TO_COLLECTION_MAP.get(platform_name))
+        if not target:
+            log_debug(logger, f"Skipping {device.get('hostname', '?')} - "
+                      f"platform '{platform_name}' not tracked")
+            continue
+        if not device.get("device_id"):
+            continue
+
+        agent_ver = device.get("agent_version", "")
+        if is_current(agent_ver, target):
+            to_remove.append(device)
+            log_debug(logger, f"Cleanup candidate: {device.get('hostname', '?')} "
+                      f"({agent_ver} >= {target})")
+
+    logger.info(f"Found {len(to_remove)} hosts to remove from force group (now at baseline)")
+    return to_remove
 
 
 # ---------------------------------------------------------------------------
 # Phase B: Enforcement
 # ---------------------------------------------------------------------------
 
-def find_stale_hosts_in_source(
-    falcon_hg: HostGroup,
-    source_group_id: str,
-    platform_key: str,
+def find_stale_hosts(
+    members: List[Dict[str, Any]],
     target_version: str,
-    existing_force_member_ids: Set[str],
+    exclude_ids: Set[str],
     logger: Logger
 ) -> List[Dict[str, Any]]:
-    """
-    Find hosts in the source group whose sensor version is behind the target
-    and are not already in the force group.
+    """Source-group members behind target_version that aren't already in the force group."""
+    stale = []
+    for device in members:
+        device_id = device.get("device_id", "")
+        if not device_id or device_id in exclude_ids:
+            continue
 
-    Queries source group members directly (scoped, efficient) rather than
-    scanning all devices in the environment.
-    """
-    fql_platform = PLATFORM_FQL_MAP[platform_key]
-    stale_hosts = []
-    offset = 0
+        # Don't enforce on hosts with no reliable version data -- skip+log
+        # instead of force-updating off (0,0,0).
+        agent_ver = device.get("agent_version", "")
+        if not has_known_version(agent_ver):
+            logger.warning(f"Skipping {device.get('hostname', '?')} "
+                           f"({device_id[:8]}) - missing/unparseable "
+                           f"agent_version {agent_ver!r}; not enforcing")
+            continue
 
-    while True:
-        log_debug(logger, f"Querying source group members for {platform_key}, offset={offset}")
-        resp = falcon_hg.query_combined_group_members(
-            id=source_group_id,
-            filter=f"platform_name:'{fql_platform}'",
-            limit=PAGE_LIMIT,
-            offset=offset
+        if not is_current(agent_ver, target_version):
+            stale.append(device)
+
+    logger.info(f"Found {len(stale)} stale hosts behind {target_version}")
+    return stale
+
+
+def enforce_platform(
+    falcon_hg: HostGroup,
+    cfg: Dict[str, Any],
+    platform: str,
+    policy_target: Dict[str, Any],
+    version_info: Dict[str, Any],
+    force_member_ids: Set[str],
+    now: int,
+    logger: Logger
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Phase B for one platform. Returns (platform_detail, added_devices, errors)."""
+    target_version = version_info.get("sensor_version", "")
+    promoted_at = version_info.get("standing_updated_timestamp", 0)
+    detail = {
+        "platform": platform,
+        "target_standing": policy_target.get("target_standing", ""),
+        "target_version": target_version,
+        "policy_name": policy_target.get("policy_name", ""),
+        "first_seen_timestamp": version_info.get("first_seen_timestamp", 0),
+        "standing_updated_timestamp": promoted_at,
+        "grace_period_expired": False,
+        "days_since_release": 0,
+        "stale_hosts_found": 0,
+        "hosts_added": 0,
+    }
+
+    if not version_info:
+        # No policy target or no collection data; already logged.
+        return detail, [], []
+
+    # No reliable promotion date (legacy record predating this field): skip
+    # rather than force-update off unknown data. The next standing change
+    # re-stamps standing_updated_timestamp and enforcement resumes.
+    if not promoted_at:
+        logger.warning(f"{platform}: no standing_updated_timestamp on target build "
+                       f"{target_version} - skipping enforcement until "
+                       f"update-sensor-tracker re-stamps the promotion date")
+        return detail, [], []
+
+    # An unparseable target would make every host look current; nothing to do.
+    if not has_known_version(target_version):
+        logger.warning(f"{platform}: target version {target_version!r} is unparseable - "
+                       f"skipping enforcement")
+        return detail, [], []
+
+    grace_period_days = cfg["grace_period_days"]
+    elapsed = now - promoted_at
+    detail["days_since_release"] = round(elapsed / 86400, 1)
+    detail["grace_period_expired"] = elapsed >= grace_period_days * 86400
+    if not detail["grace_period_expired"]:
+        logger.info(f"{platform}: grace period active ({detail['days_since_release']} days / "
+                    f"{grace_period_days} days) - skipping enforcement")
+        return detail, [], []
+
+    logger.info(f"{platform}: grace period expired ({detail['days_since_release']} days >= "
+                f"{grace_period_days} days) - finding stale hosts in source group")
+    try:
+        members = get_group_members(
+            falcon_hg, cfg["source_group_id"], logger,
+            label=f"source group ({platform})",
+            fql_filter=f"platform_name:'{PLATFORM_FQL_MAP[platform]}'",
         )
+    except FalconAPIError as e:
+        logger.error(str(e))
+        return detail, [], [{"operation": "query-source-group", "error": str(e)}]
 
-        if resp.get("status_code") != 200:
-            logger.error(f"Failed to query source group members: {resp.get('status_code')} "
-                         f"{resp.get('body', {}).get('errors', [])}")
-            break
+    stale = find_stale_hosts(members, target_version, force_member_ids, logger)
+    detail["stale_hosts_found"] = len(stale)
 
-        resources = resp.get("body", {}).get("resources", [])
-        if not resources:
-            break
-
-        for device in resources:
-            device_id = device.get("device_id", "")
-
-            # Skip if already in the force group
-            if device_id in existing_force_member_ids:
-                continue
-
-            # Don't enforce on hosts with no reliable version data -- skip+log
-            # instead of force-updating off (0,0,0).
-            agent_ver = device.get("agent_version", "")
-            if not has_known_version(agent_ver):
-                logger.warning(f"Skipping {device.get('hostname', '?')} "
-                               f"({device_id[:8]}) - missing/unparseable "
-                               f"agent_version {agent_ver!r}; not enforcing")
-                continue
-
-            # Check if the host is behind the target version
-            if not is_current(agent_ver, target_version):
-                stale_hosts.append(device)
-
-        total = resp.get("body", {}).get("meta", {}).get("pagination", {}).get("total", 0)
-        offset += PAGE_LIMIT
-        if offset >= total:
-            break
-
-    logger.info(f"Found {len(stale_hosts)} stale hosts in source group on {platform_key}")
-    return stale_hosts
+    added_ids, errors = batch_modify_group(
+        falcon_hg, cfg["force_group_id"], [d["device_id"] for d in stale],
+        "add-hosts", cfg["dry_run"], logger
+    )
+    added_set = set(added_ids)
+    added = [d for d in stale if d["device_id"] in added_set]
+    detail["hosts_added"] = len(added)
+    return detail, added, errors
 
 
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
+
+def run_enforcement(cfg: Dict[str, Any], logger: Logger) -> Response:
+    now = int(time.time())
+    dry_run = cfg["dry_run"]
+    platforms = cfg["platforms"]
+
+    # FalconPy clients are built per request: context auth only has a token
+    # while a request is being handled. CustomStorage (not the Uber class) lets
+    # the Foundry functions editor auto-detect OAuth scopes; ext_headers
+    # applies X-CS-APP-ID to every request.
+    storage = CustomStorage(ext_headers=get_headers())
+    falcon_hg = HostGroup()
+    falcon_sensor = SensorUpdatePolicies()
+
+    # --- Detect source policy targets ---
+    policy_targets = get_source_policy_targets(
+        falcon_sensor, cfg["source_group_id"], cfg["target_standing_override"], logger
+    )
+    if not policy_targets:
+        return error_response(
+            400,
+            "No enabled sensor update policy with a release standing is attached to "
+            "SOURCE_GROUP_ID. Check the group ID and its policy, or set TARGET_STANDING "
+            "if the policy pins a specific build."
+        )
+    policy_targets = {k: v for k, v in policy_targets.items() if k in platforms}
+
+    # --- Look up current builds at the target standings from the collection ---
+    target_versions, errors = get_target_versions(storage, policy_targets, logger)
+
+    # ===============================================================
+    # PHASE A: CLEANUP - Remove hosts that now meet the source target.
+    # Runs even without collection data, using the policy version.
+    # ===============================================================
+    logger.info("=== Phase A: Cleanup ===")
+    force_members = get_group_members(falcon_hg, cfg["force_group_id"], logger, label="force group")
+    hosts_to_remove = find_hosts_to_cleanup(
+        force_members, get_cleanup_targets(policy_targets, target_versions, logger), logger
+    )
+    removed_ids, remove_errors = batch_modify_group(
+        falcon_hg, cfg["force_group_id"], [d["device_id"] for d in hosts_to_remove],
+        "remove-hosts", dry_run, logger
+    )
+    errors.extend(remove_errors)
+    removed_set = set(removed_ids)
+    cleanup_result = {
+        "hosts_evaluated": len(force_members),
+        "hosts_removed": len(removed_ids),
+        "removed_hosts": [_host_summary(d) for d in hosts_to_remove if d["device_id"] in removed_set],
+    }
+
+    # ===============================================================
+    # PHASE B: ENFORCEMENT - Add stale source group hosts after grace.
+    # Needs collection data for the promotion timestamp; a platform
+    # without it is skipped (Phase A still ran).
+    # ===============================================================
+    logger.info("=== Phase B: Enforcement ===")
+    # Hosts just removed in Phase A are at the target, so they can't be stale;
+    # excluding every current force-group member is enough.
+    force_member_ids = {m["device_id"] for m in force_members if m.get("device_id")}
+    platform_details = []
+    added_hosts = []
+    for platform in platforms:
+        detail, added, platform_errors = enforce_platform(
+            falcon_hg, cfg, platform, policy_targets.get(platform, {}),
+            target_versions.get(platform, {}), force_member_ids, now, logger
+        )
+        platform_details.append(detail)
+        added_hosts.extend(_host_summary(d) for d in added)
+        errors.extend(platform_errors)
+
+    enforcement_result = {
+        "platforms_checked": len(platforms),
+        "platforms_expired": sum(1 for d in platform_details if d["grace_period_expired"]),
+        "hosts_added": len(added_hosts),
+        "platform_details": platform_details,
+        "added_hosts": added_hosts,
+    }
+
+    success = not errors
+    logger.info(f"Done - cleanup removed {len(removed_ids)}, enforcement added {len(added_hosts)}, "
+                f"errors: {len(errors)}, dry_run: {dry_run}")
+    return Response(
+        code=200 if success else 207,
+        body={
+            "success": success,
+            "dry_run": dry_run,
+            "timestamp": now,
+            "grace_period_days": cfg["grace_period_days"],
+            "policy_targets": {k: v["target_standing"] for k, v in policy_targets.items()},
+            "cleanup": cleanup_result,
+            "enforcement": enforcement_result,
+            "errors": errors or None,
+        },
+    )
+
 
 @FUNC.handler(method="POST", path="/enforce-grace-period")
 def enforce_grace_period_handler(
@@ -665,234 +784,29 @@ def enforce_grace_period_handler(
     logger: Logger
 ) -> Response:
     _ = config
+    logger.info("Starting enforce-grace-period")
+
+    body = request.body or {}
+    if not isinstance(body, dict):
+        logger.warning("Rejected request: body is not a JSON object")
+        return error_response(400, "Request body must be a JSON object")
 
     try:
-        logger.info("Starting enforce-grace-period")
-        now = int(time.time())
+        cfg = load_config(body, logger)
+    except ValueError as e:
+        logger.warning(f"Rejected request: {e}")
+        return error_response(400, str(e))
 
-        # --- Config ---
-        body = request.body if request.body else {}
-        cfg, err = load_config(body, logger)
-        if err:
-            return err
-
-        source_group_id = cfg["source_group_id"]
-        force_group_id = cfg["force_group_id"]
-        grace_period_days = cfg["grace_period_days"]
-        platforms = cfg["platforms"]
-        target_standing_override = cfg["target_standing_override"]
-        dry_run = cfg["dry_run"]
-
-        # --- Init clients ---
-        # CustomStorage service class (not the Uber class): the Foundry
-        # functions editor auto-detects OAuth scopes from this import.
-        # ext_headers applies X-CS-APP-ID to every request.
-        storage = CustomStorage(ext_headers=get_headers())
-        falcon_hg = HostGroup()
-        falcon_sensor = SensorUpdatePolicies()
-
-        # --- Detect source policy targets ---
-        policy_targets = get_source_policy_targets(
-            falcon_sensor, source_group_id, target_standing_override, logger
-        )
-        if not policy_targets:
-            return Response(
-                code=400,
-                errors=[APIError(
-                    code=400,
-                    message="Could not detect target standing from source group's policy. "
-                            "Verify SOURCE_GROUP_ID is correct and has a sensor update policy "
-                            "attached, or set TARGET_STANDING env var manually."
-                )]
-            )
-
-        # Filter to only requested platforms
-        policy_targets = {k: v for k, v in policy_targets.items() if k in platforms}
-
-        # --- Look up current builds at the target standings from collection ---
-        target_versions = get_target_versions(storage, policy_targets, logger)
-
-        # Build cleanup targets: prefer collection data, fall back to policy's
-        # own sensor_version so Phase A can always run even if the collection
-        # is empty or stale.
-        cleanup_targets = {}
-        for platform, target_info in policy_targets.items():
-            if platform in target_versions:
-                cleanup_targets[platform] = target_versions[platform]
-            elif target_info.get("policy_sensor_version"):
-                cleanup_targets[platform] = {
-                    "sensor_version": target_info["policy_sensor_version"],
-                    "target_standing": target_info["target_standing"],
-                    "policy_name": target_info["policy_name"],
-                    "first_seen_timestamp": 0,
-                }
-                logger.warning(f"{platform}: Collection has no data for standing "
-                               f"'{target_info['target_standing']}'. Using policy "
-                               f"sensor_version '{target_info['policy_sensor_version']}' "
-                               f"as fallback for cleanup.")
-
-        all_errors = []
-
-        # ===============================================================
-        # PHASE A: CLEANUP - Remove hosts that now meet the source target
-        # (Always runs if the force group has members, even without
-        #  collection data, using the policy version as fallback.)
-        # ===============================================================
-        logger.info("=== Phase A: Cleanup ===")
-        force_members = get_group_members(falcon_hg, force_group_id, logger, label="force group")
-        hosts_to_remove = find_hosts_to_cleanup(force_members, cleanup_targets, logger)
-
-        remove_ids = {d["device_id"] for d in hosts_to_remove}
-        removed_count, remove_errors = batch_modify_group(
-            falcon_hg, force_group_id, list(remove_ids), "remove-hosts", dry_run, logger
-        )
-        all_errors.extend(remove_errors)
-
-        cleanup_result = {
-            "hosts_evaluated": len(force_members),
-            "hosts_removed": removed_count,
-            "removed_hosts": [_host_summary(d) for d in hosts_to_remove],
-        }
-
-        # ===============================================================
-        # PHASE B: ENFORCEMENT - Add stale source group hosts after grace
-        # (Requires collection data for grace period timestamps. If the
-        #  collection is empty, Phase B is skipped but Phase A still ran.)
-        # ===============================================================
-        logger.info("=== Phase B: Enforcement ===")
-
-        # Build set of device IDs currently in force group (excluding those just removed)
-        existing_force_ids: Set[str] = set()
-        for m in force_members:
-            mid = m.get("device_id", "")
-            if mid and mid not in remove_ids:
-                existing_force_ids.add(mid)
-
-        grace_seconds = grace_period_days * 86400
-        platform_details = []
-        all_added_hosts = []
-        total_added = 0
-
-        for platform in platforms:
-            if platform not in target_versions:
-                platform_details.append({
-                    "platform": platform,
-                    "target_standing": policy_targets.get(platform, {}).get("target_standing", ""),
-                    "target_version": "",
-                    "policy_name": policy_targets.get(platform, {}).get("policy_name", ""),
-                    "first_seen_timestamp": 0,
-                    "standing_updated_timestamp": 0,
-                    "grace_period_expired": False,
-                    "days_since_release": 0,
-                    "stale_hosts_found": 0,
-                    "hosts_added": 0,
-                })
-                continue
-
-            version_info = target_versions[platform]
-            # Grace counts from when the build was promoted to the target
-            # standing, so GRACE_PERIOD_DAYS actually applies for n-1/n-2 targets.
-            promoted_at = version_info["standing_updated_timestamp"]
-
-            # No reliable promotion date (legacy record predating this field):
-            # skip rather than force-update off unknown data. The next standing
-            # change re-stamps standing_updated_timestamp and enforcement resumes.
-            if not promoted_at:
-                logger.warning(f"{platform}: no standing_updated_timestamp on target build "
-                               f"{version_info['sensor_version']} - skipping enforcement until "
-                               f"update-sensor-tracker re-stamps the promotion date")
-                platform_details.append({
-                    "platform": platform,
-                    "target_standing": version_info["target_standing"],
-                    "target_version": version_info["sensor_version"],
-                    "policy_name": version_info.get("policy_name", ""),
-                    "first_seen_timestamp": version_info["first_seen_timestamp"],
-                    "standing_updated_timestamp": 0,
-                    "grace_period_expired": False,
-                    "days_since_release": 0,
-                    "stale_hosts_found": 0,
-                    "hosts_added": 0,
-                })
-                continue
-
-            elapsed = now - promoted_at
-            days_since = round(elapsed / 86400, 1)
-            expired = elapsed >= grace_seconds
-
-            detail = {
-                "platform": platform,
-                "target_standing": version_info["target_standing"],
-                "target_version": version_info["sensor_version"],
-                "policy_name": version_info.get("policy_name", ""),
-                "first_seen_timestamp": version_info["first_seen_timestamp"],
-                "standing_updated_timestamp": promoted_at,
-                "grace_period_expired": expired,
-                "days_since_release": days_since,
-                "stale_hosts_found": 0,
-                "hosts_added": 0,
-            }
-
-            if not expired:
-                logger.info(f"{platform}: grace period active ({days_since} days / "
-                            f"{grace_period_days} days) - skipping enforcement")
-                platform_details.append(detail)
-                continue
-
-            logger.info(f"{platform}: grace period expired ({days_since} days >= "
-                        f"{grace_period_days} days) - finding stale hosts in source group")
-
-            stale = find_stale_hosts_in_source(
-                falcon_hg, source_group_id, platform,
-                version_info["sensor_version"], existing_force_ids, logger
-            )
-            detail["stale_hosts_found"] = len(stale)
-
-            if stale:
-                stale_ids = [d["device_id"] for d in stale]
-                added, add_errors = batch_modify_group(
-                    falcon_hg, force_group_id, stale_ids, "add-hosts", dry_run, logger
-                )
-                detail["hosts_added"] = added
-                total_added += added
-                all_errors.extend(add_errors)
-
-                for d in stale:
-                    all_added_hosts.append(_host_summary(d))
-                    existing_force_ids.add(d["device_id"])
-
-            platform_details.append(detail)
-
-        enforcement_result = {
-            "platforms_checked": len(platforms),
-            "platforms_expired": sum(1 for d in platform_details if d["grace_period_expired"]),
-            "hosts_added": total_added,
-            "platform_details": platform_details,
-            "added_hosts": all_added_hosts,
-        }
-
-        # --- Build response ---
-        success = len(all_errors) == 0
-        response_body = {
-            "success": success,
-            "dry_run": dry_run,
-            "timestamp": now,
-            "grace_period_days": grace_period_days,
-            "policy_targets": {k: v["target_standing"] for k, v in policy_targets.items()},
-            "cleanup": cleanup_result,
-            "enforcement": enforcement_result,
-            "errors": all_errors if all_errors else None,
-        }
-        response_code = 200 if success else 207
-
-        logger.info(f"Done - cleanup removed {removed_count}, enforcement added {total_added}, "
-                    f"errors: {len(all_errors)}, dry_run: {dry_run}")
-        return Response(body=response_body, code=response_code)
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        return Response(
-            code=500,
-            errors=[APIError(code=500, message=f"Internal error: {str(e)}")]
+    try:
+        return run_enforcement(cfg, logger)
+    except FalconAPIError as e:
+        # A read the run can't proceed without (policies, force group) failed.
+        logger.error(str(e))
+        return error_response(e.status_code, str(e))
+    except Exception:
+        logger.exception("Unexpected error in enforce-grace-period")
+        return error_response(
+            500, f"Internal error (trace_id={request.trace_id or 'n/a'}); see function logs"
         )
 
 

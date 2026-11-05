@@ -11,6 +11,7 @@ ignored:
     - .+/node_modules/.+
     - .+/venv$
     - .+/venv/.+
+    - '(^|/)__pycache__(/|$)'
 ui:
     homepage: pages.sensor_release_tracker
     extensions: []

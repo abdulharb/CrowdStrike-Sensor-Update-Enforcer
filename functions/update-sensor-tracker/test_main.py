@@ -161,8 +161,7 @@ def test_unchanged_standing_is_skipped_no_put(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # In-response tagged/untagged duplicate must NOT clobber the tagged record
-# (this is what line ~302's tagged_this_run skip protects -- verify removing
-#  the old guard didn't break it)
+# (dedupe_builds keeps the tagged copy)
 # ---------------------------------------------------------------------------
 
 def test_untagged_duplicate_does_not_clobber_new_build(monkeypatch):
@@ -371,13 +370,67 @@ def test_read_existing_record_bytes_path():
     assert out["release_standing"] == "n-2"
 
 
-def test_read_existing_record_200_without_record_returns_none():
-    # RISK documented: a 200 whose body isn't the record yields None, so the
-    # caller treats the build as NEW and resets first_seen_timestamp -- which
-    # silently restarts the enforce grace clock every run.
-    out = main.read_existing_record(StoreGet200NoRecord(), main.COLLECTION_NAME,
-                                    "linux_18909", LOGGER)
-    assert out is None
+def test_read_existing_record_200_without_record_raises():
+    # A 200 whose body isn't the record must NOT read as "not found": the
+    # caller would treat the build as NEW and reset its timestamps, silently
+    # restarting the enforcer's grace clock.
+    with pytest.raises(RuntimeError):
+        main.read_existing_record(StoreGet200NoRecord(), main.COLLECTION_NAME,
+                                  "linux_18909", LOGGER)
+
+
+def test_read_existing_record_404_returns_none():
+    assert main.read_existing_record(FakeStore(), main.COLLECTION_NAME,
+                                     "linux_18909", LOGGER) is None
+
+
+class FakeStoreFlakyGet(FakeStore):
+    """GetObject fails transiently (e.g. rate limited); PutObject works."""
+
+    def GetObject(self, **kwargs):
+        return {"status_code": 429, "body": {"errors": [{"message": "rate limited"}]}}
+
+
+def test_transient_read_error_does_not_overwrite_record(monkeypatch):
+    # Regression: a failed read used to fall through as "new record", rewriting
+    # the build with fresh timestamps and an empty history.
+    initial = {"linux_18803": record(
+        "18803", "n-1", prev=[{"standing": "n", "timestamp": 100}], first=100, updated=500)}
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    store = FakeStoreFlakyGet(initial)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k: store)
+    monkeypatch.setattr(main, "SensorUpdatePolicies",
+                        lambda *a, **k: FakeSensor({"linux": [api_build("7.35.18803", "18803|n-2|tagged|6")]}))
+    req = Request(method="POST", url="/update-sensor-tracker", body={"platforms": ["linux"]})
+    resp = main.FUNC._router.route(req, logger=LOGGER)
+
+    assert resp.code == 207
+    assert store.put_keys == []  # nothing written
+    assert store.objects["linux_18803"] == initial["linux_18803"]
+    assert "rate limited" in resp.body["errors"][0]["error"]
+
+
+def test_duplicates_collapse_to_one_entry_per_build(monkeypatch):
+    resp, store = run_handler(
+        monkeypatch,
+        {"linux": [
+            api_build("7.36.18909", "18909"),               # untagged copy listed first
+            api_build("7.36.18909", "18909|n-2|tagged|6"),
+        ]},
+    )
+    assert standings(store) == {"18909": "n-2"}
+    assert store.put_keys == ["linux_18909"]  # written once
+    assert resp.body["summary"]["total_api_records"] == 2
+    assert resp.body["summary"]["new_entries_created"] == 1
+
+
+def test_non_dict_body_and_bad_stage_return_400(monkeypatch):
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.setattr(main, "CustomStorage", lambda *a, **k: FakeStore())
+    monkeypatch.setattr(main, "SensorUpdatePolicies", lambda *a, **k: FakeSensor({}))
+    for body in (["linux"], {"platforms": ["linux"], "stage": ""}, {"platforms": [3]}):
+        req = Request(method="POST", url="/update-sensor-tracker", body=body)
+        assert main.FUNC._router.route(req, logger=LOGGER).code == 400, body
 
 
 def test_invalid_platform_returns_400(monkeypatch):

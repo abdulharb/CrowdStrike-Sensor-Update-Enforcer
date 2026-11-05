@@ -9,9 +9,8 @@ Field shapes here mirror what the live US-2 tenant actually returns
                       capitalized; settings.build / settings.sensor_version
   - group members:    device_id, platform_name (capitalized), agent_version, hostname
 
-Some tests DOCUMENT current behavior that the review flagged as risky
-(empty agent_version -> treated stale -> force-updated). Those are marked
-with `BEHAVIOR:` so a future fix flips the assertion intentionally, not by
+Some tests DOCUMENT deliberate behavior choices. Those are marked with
+`BEHAVIOR:` so a future change flips the assertion intentionally, not by
 accident.
 
 The handler is registered on FUNC via @FUNC.handler; it's invoked through
@@ -54,13 +53,23 @@ def _resp(resources, total=None, status=200):
 
 
 class FakeSensor:
-    """Stand-in for SensorUpdatePolicies."""
+    """Stand-in for SensorUpdatePolicies.
 
-    def __init__(self, policies=None):
+    Returns policies in the order given, standing in for the API's
+    sort=precedence.asc ordering (the live response omits 'precedence', so
+    the order is the only signal). Pass status to simulate an API failure.
+    """
+
+    def __init__(self, policies=None, status=200):
         self._policies = policies or []
+        self.status = status
+        self.sorts = []  # sort param of every call
 
-    def query_combined_policies_v2(self, limit=200, offset=0):
-        # Single page; pagination loop in _fetch_all_policies stops after this.
+    def query_combined_policies_v2(self, limit=200, offset=0, sort=None):
+        self.sorts.append(sort)
+        if self.status != 200:
+            return {"status_code": self.status,
+                    "body": {"errors": [{"message": "access denied"}]}}
         if offset == 0:
             return _resp(self._policies, total=len(self._policies))
         return _resp([], total=len(self._policies))
@@ -69,12 +78,15 @@ class FakeSensor:
 class FakeHostGroup:
     """Stand-in for HostGroup. members_by_group: {group_id: [device, ...]}."""
 
-    def __init__(self, members_by_group=None, action_status=200):
+    def __init__(self, members_by_group=None, action_status=200, failing_groups=()):
         self.members_by_group = members_by_group or {}
         self.action_status = action_status
+        self.failing_groups = set(failing_groups)  # member queries return 500
         self.actions = []  # recorded perform_group_action calls
 
     def query_combined_group_members(self, id, limit=5000, offset=0, filter=None):
+        if id in self.failing_groups:
+            return {"status_code": 500, "body": None}
         members = self.members_by_group.get(id, [])
         if filter and "platform_name:" in filter:
             # crude parse of platform_name:'Windows'
@@ -87,9 +99,11 @@ class FakeHostGroup:
 
     def perform_group_action(self, action_name, body):
         self.actions.append({"action": action_name, "body": _copy(body)})
-        return {"status_code": self.action_status,
-                "body": {} if self.action_status == 200
-                else {"errors": [{"message": "boom"}]}}
+        status = self.action_status
+        if isinstance(status, dict):  # per-action status, e.g. {"add-hosts": 500}
+            status = status.get(action_name, 200)
+        return {"status_code": status,
+                "body": {} if status == 200 else {"errors": [{"message": "boom"}]}}
 
 
 class FakeStore:
@@ -197,19 +211,25 @@ def test_source_policy_single_match_maps_standing():
     assert targets["windows"]["policy_sensor_version"] == "7.36.20805"
 
 
-def test_source_policy_two_policies_same_platform_does_not_crash():
-    # Live reality: precedence key absent -> both default to 9999.
-    # Two Windows policies attached to the source group must NOT raise
-    # (this is the exact US-2 config: 'Force Update' + 'Normal').
+def test_source_policy_requests_precedence_order():
+    # The live response omits 'precedence', so ordering must come from the
+    # API's sort parameter for "first policy wins" to match CrowdStrike.
+    sensor = FakeSensor([policy("Force Update")])
+    main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
+    assert sensor.sorts and all(s == "precedence.asc" for s in sensor.sorts)
+
+
+def test_source_policy_two_policies_same_platform_highest_precedence_wins():
+    # Two Windows policies attached to the source group (the exact US-2
+    # config: 'Force Update' + 'Normal'). The API returns them in precedence
+    # order, so the first one is what the hosts actually get.
     sensor = FakeSensor([
         policy("Force Update", groups=("SRC",)),
-        policy("Normal", groups=("SRC", "OTHER")),
+        policy("Normal", build="20703|n-1|tagged|2", groups=("SRC", "OTHER")),
     ])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
-    assert targets["windows"]["target_standing"] == "n-2"
-    # BEHAVIOR: selection is first-returned-wins (precedence is non-functional
-    # because the API omits it). If precedence handling is fixed, update this.
     assert targets["windows"]["policy_name"] == "Force Update"
+    assert targets["windows"]["target_standing"] == "n-2"
 
 
 def test_source_policy_ignores_unattached_policies():
@@ -231,23 +251,50 @@ def test_source_policy_target_standing_override():
     assert targets["windows"]["target_standing"] == "n-1"
 
 
-def test_source_policy_untagged_does_not_replace_valid_target():
-    # A pinned (untagged) policy with better precedence must not clobber an
-    # already-found valid target -- and must not log a bogus "Replacing".
-    pinned = policy("Pinned", build="20505", sensor_version="7.33.20505")
-    pinned["precedence"] = 1
-    sensor = FakeSensor([policy("Force Update", groups=("SRC",)), pinned])
+def test_source_policy_lower_precedence_pinned_policy_is_ignored():
+    sensor = FakeSensor([
+        policy("Force Update", groups=("SRC",)),
+        policy("Pinned", build="20505", sensor_version="7.33.20505"),
+    ])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
     assert targets["windows"]["policy_name"] == "Force Update"
     assert targets["windows"]["target_standing"] == "n-2"
 
 
-def test_source_policy_disabled_policy_currently_still_used():
-    # BEHAVIOR: the code does NOT filter enabled=False. CrowdStrike ignores
-    # disabled policies; this documents the current divergence.
+def test_source_policy_highest_precedence_pinned_policy_skips_platform():
+    # BEHAVIOR: when the policy the hosts actually get pins a build, don't fall
+    # back to a lower-precedence tagged policy -- enforcing that standing would
+    # override the admin's pin. TARGET_STANDING opts back in.
+    sensor = FakeSensor([
+        policy("Pinned", build="20505", sensor_version="7.33.20505"),
+        policy("Force Update", groups=("SRC",)),
+    ])
+    assert main.get_source_policy_targets(sensor, "SRC", None, LOGGER) == {}
+    targets = main.get_source_policy_targets(sensor, "SRC", "n-1", LOGGER)
+    assert targets["windows"]["policy_name"] == "Pinned"
+    assert targets["windows"]["target_standing"] == "n-1"
+
+
+def test_source_policy_disabled_policy_is_ignored():
+    # CrowdStrike ignores disabled policies; so does the enforcer.
     sensor = FakeSensor([policy("Disabled", enabled=False, groups=("SRC",))])
+    assert main.get_source_policy_targets(sensor, "SRC", None, LOGGER) == {}
+
+    sensor = FakeSensor([
+        policy("Disabled", build="20903|n|tagged|1", enabled=False),
+        policy("Normal"),
+    ])
     targets = main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
-    assert "windows" in targets  # flip to `== {}` when enabled-filtering is added
+    assert targets["windows"]["policy_name"] == "Normal"
+    assert targets["windows"]["target_standing"] == "n-2"
+
+
+def test_source_policy_query_failure_raises_with_api_message():
+    sensor = FakeSensor(status=403)
+    with pytest.raises(main.FalconAPIError) as exc:
+        main.get_source_policy_targets(sensor, "SRC", None, LOGGER)
+    assert exc.value.status_code == 403
+    assert "access denied" in str(exc.value)
 
 
 # ===========================================================================
@@ -293,32 +340,34 @@ def test_cleanup_unparseable_target_skips_platform():
 
 
 # ===========================================================================
-# find_stale_hosts_in_source  (Phase B candidate selection)
+# find_stale_hosts  (Phase B candidate selection)
 # ===========================================================================
 
 def test_stale_finds_behind_hosts():
-    hg = FakeHostGroup({"SRC": [device("d1", "7.30.20000"), device("d2", "7.36.20805")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", set(), LOGGER)
+    members = [device("d1", "7.30.20000"), device("d2", "7.36.20805")]
+    out = main.find_stale_hosts(members, "7.36.20805", set(), LOGGER)
     assert [d["device_id"] for d in out] == ["d1"]
 
 
 def test_stale_skips_hosts_already_in_force_group():
-    hg = FakeHostGroup({"SRC": [device("d1", "7.30.20000")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", {"d1"}, LOGGER)
+    members = [device("d1", "7.30.20000")]
+    out = main.find_stale_hosts(members, "7.36.20805", {"d1"}, LOGGER)
     assert out == []
 
 
 def test_stale_empty_agent_version_is_skipped():
     # E2 fix: blank/unparseable version -> NOT enforced (skip+log), instead of
     # being force-updated off (0,0,0).
-    hg = FakeHostGroup({"SRC": [device("d1", ""), device("d2", "garbage"),
-                                device("d3", "7.30.20000")]})
-    out = main.find_stale_hosts_in_source(
-        hg, "SRC", "windows", "7.36.20805", set(), LOGGER)
+    members = [device("d1", ""), device("d2", "garbage"), device("d3", "7.30.20000")]
+    out = main.find_stale_hosts(members, "7.36.20805", set(), LOGGER)
     # Only the host with a real, behind version is enforced.
     assert [d["device_id"] for d in out] == ["d3"]
+
+
+def test_stale_skips_members_without_device_id():
+    members = [device("", "7.30.20000"), device("d2", "7.30.20000")]
+    out = main.find_stale_hosts(members, "7.36.20805", set(), LOGGER)
+    assert [d["device_id"] for d in out] == ["d2"]
 
 
 def test_has_known_version():
@@ -335,9 +384,9 @@ def test_has_known_version():
 
 def test_batch_dry_run_makes_no_calls():
     hg = FakeHostGroup()
-    count, errors = main.batch_modify_group(
+    done, errors = main.batch_modify_group(
         hg, "FORCE", ["d1", "d2"], "add-hosts", dry_run=True, logger=LOGGER)
-    assert count == 2
+    assert done == ["d1", "d2"]
     assert errors == []
     assert hg.actions == []  # nothing actually performed
 
@@ -345,27 +394,28 @@ def test_batch_dry_run_makes_no_calls():
 def test_batch_splits_into_500_chunks():
     hg = FakeHostGroup()
     ids = [f"d{i}" for i in range(600)]
-    count, errors = main.batch_modify_group(
+    done, errors = main.batch_modify_group(
         hg, "FORCE", ids, "add-hosts", dry_run=False, logger=LOGGER)
-    assert count == 600
+    assert done == ids
     assert errors == []
     assert len(hg.actions) == 2  # 500 + 100
 
 
 def test_batch_reports_errors_on_non_200():
     hg = FakeHostGroup(action_status=500)
-    count, errors = main.batch_modify_group(
+    done, errors = main.batch_modify_group(
         hg, "FORCE", ["d1"], "remove-hosts", dry_run=False, logger=LOGGER)
-    assert count == 0
+    assert done == []
     assert len(errors) == 1
     assert errors[0]["operation"] == "remove-hosts"
+    assert "boom" in errors[0]["error"]  # the API's own message is surfaced
 
 
 def test_batch_empty_list_noop():
     hg = FakeHostGroup()
-    count, errors = main.batch_modify_group(
+    done, errors = main.batch_modify_group(
         hg, "FORCE", [], "add-hosts", dry_run=False, logger=LOGGER)
-    assert (count, errors) == (0, [])
+    assert (done, errors) == ([], [])
     assert hg.actions == []
 
 
@@ -405,6 +455,91 @@ def test_handler_grace_period_out_of_range_returns_400(monkeypatch):
         resp = _route(monkeypatch, sensor=FakeSensor([]), hg=FakeHostGroup(),
                       store=FakeStore(), body={"grace_period_days": bad}, env=BASE_ENV)
         assert resp.code == 400, f"grace_period_days={bad} should be rejected"
+
+
+@pytest.mark.parametrize("env_override,body", [
+    ({"FORCE_UPDATE_GROUP_ID": "SRC"}, {}),          # same group would gut the source group
+    ({"GRACE_PERIOD_DAYS": "7d"}, {}),               # misconfig must not silently become 3
+    ({"PLATFORMS": "windows,solaris"}, {}),
+    ({"TARGET_STANDING": "N2"}, {}),
+    ({}, {"dry_run": "false"}),                      # truthy string is not a boolean
+    ({}, {"grace_period_days": True}),
+    ({}, {"platforms": "windows"}),
+    ({}, {"platforms": [1]}),
+])
+def test_handler_invalid_config_returns_400(monkeypatch, env_override, body):
+    hg = FakeHostGroup()
+    resp = _route(monkeypatch, sensor=FakeSensor([policy("Force Update")]), hg=hg,
+                  store=FakeStore(), body=body, env=dict(BASE_ENV, **env_override))
+    assert resp.code == 400
+    assert hg.actions == []
+
+
+def test_load_config_normalizes_platforms(monkeypatch):
+    monkeypatch.setenv("SOURCE_GROUP_ID", "SRC")
+    monkeypatch.setenv("FORCE_UPDATE_GROUP_ID", "FORCE")
+    monkeypatch.setenv("PLATFORMS", " Windows, mac,windows ")
+    monkeypatch.delenv("GRACE_PERIOD_DAYS", raising=False)
+    cfg = main.load_config({}, LOGGER)
+    assert cfg["platforms"] == ["windows", "mac"]
+    assert cfg["grace_period_days"] == main.DEFAULT_GRACE_PERIOD_DAYS
+
+
+def test_handler_policy_query_failure_surfaces_api_error(monkeypatch):
+    hg = FakeHostGroup()
+    resp = _route(monkeypatch, sensor=FakeSensor(status=403), hg=hg,
+                  store=FakeStore(), body={}, env=BASE_ENV)
+    # The API's own status and message, not a guessed "check SOURCE_GROUP_ID".
+    assert resp.code == 403
+    assert "access denied" in resp.errors[0].message
+    assert hg.actions == []
+
+
+def test_handler_force_group_query_failure_aborts(monkeypatch):
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",))])
+    store = FakeStore({("Windows", "n-2"): collection_record("7.36.20805", first_seen=1)})
+    hg = FakeHostGroup({"SRC": [device("s_stale", "7.30.20000")]}, failing_groups={"FORCE"})
+    resp = _route(monkeypatch, sensor=sensor, hg=hg, store=store, body={}, env=BASE_ENV)
+    assert resp.code == 500
+    assert "force group" in resp.errors[0].message
+    assert hg.actions == []
+
+
+def test_handler_source_group_query_failure_is_partial(monkeypatch):
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",))])
+    store = FakeStore({("Windows", "n-2"): collection_record("7.36.20805", first_seen=1)})
+    hg = FakeHostGroup({"FORCE": [device("f_done", "7.36.20805")]}, failing_groups={"SRC"})
+    resp = _route(monkeypatch, sensor=sensor, hg=hg, store=store, body={}, env=BASE_ENV)
+    assert resp.code == 207
+    assert resp.body["success"] is False
+    assert resp.body["cleanup"]["hosts_removed"] == 1  # Phase A still ran
+    assert resp.body["errors"][0]["operation"] == "query-source-group"
+
+
+def test_handler_failed_add_is_not_reported_as_added(monkeypatch):
+    sensor = FakeSensor([policy("Force Update", groups=("SRC",))])
+    store = FakeStore({("Windows", "n-2"): collection_record("7.36.20805", first_seen=1)})
+    hg = FakeHostGroup({
+        "FORCE": [device("f_done", "7.36.20805")],
+        "SRC": [device("s_stale", "7.30.20000")],
+    }, action_status={"add-hosts": 500})
+    resp = _route(monkeypatch, sensor=sensor, hg=hg, store=store, body={}, env=BASE_ENV)
+    assert resp.code == 207
+    assert resp.body["cleanup"]["hosts_removed"] == 1
+    enforcement = resp.body["enforcement"]
+    assert enforcement["platform_details"][0]["stale_hosts_found"] == 1
+    assert enforcement["hosts_added"] == 0
+    assert enforcement["added_hosts"] == []
+
+
+def test_handler_unexpected_exception_returns_generic_500(monkeypatch):
+    class ExplodingSensor:
+        def query_combined_policies_v2(self, **kwargs):
+            raise RuntimeError("secret internal detail")
+    resp = _route(monkeypatch, sensor=ExplodingSensor(), hg=FakeHostGroup(),
+                  store=FakeStore(), body={}, env=BASE_ENV)
+    assert resp.code == 500
+    assert "secret internal detail" not in resp.errors[0].message
 
 
 def test_handler_no_policy_on_source_returns_400(monkeypatch):

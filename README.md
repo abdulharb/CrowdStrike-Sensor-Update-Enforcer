@@ -13,7 +13,7 @@ You have a sensor update policy with a maintenance window (e.g., no updates betw
 
 ## The Solution
 
-This app gives hosts a configurable grace period after a new sensor version appears at the policy's target standing. If a host hasn't updated by the time the grace period expires, it gets added to a "force update" host group whose policy pushes the update on the next cloud connection -- regardless of time of day.
+This app gives hosts a configurable grace period after a new sensor build reaches the policy's target standing. If a host hasn't updated by the time the grace period expires, it gets added to a "force update" host group whose policy pushes the update on the next cloud connection -- regardless of time of day.
 
 Once the host is updated, the app automatically removes it from the force group.
 
@@ -32,15 +32,15 @@ Two Foundry Functions run on a bundled scheduled workflow (every 4 hours):
 
 ### 1. update-sensor-tracker
 
-Polls the CrowdStrike sensor builds API and records when new versions appear at each release standing (N, N-1, N-2) in a Foundry Collection with timestamps. This collection is the source of truth for when a version first appeared -- which is how the grace period is calculated.
+Polls the CrowdStrike sensor builds API and keeps one record per build in a Foundry Collection: its current release standing (N, N-1, N-2, or untagged once it ages out), when it was first seen, when it reached its current standing, and its standing history. The "reached its current standing" timestamp is what the grace period counts from.
 
 ### 2. enforce-grace-period
 
-Reads the source host group's sensor update policy to determine the target standing (e.g., N-2), then runs in two phases:
+Reads the source host group's sensor update policy to determine the target standing (e.g., N-2), then runs in two phases. If several policies are attached to the source group for a platform, the highest-precedence **enabled** one is used -- the one those hosts actually receive. If that policy pins a specific build (no standing), the platform is skipped unless `TARGET_STANDING` is set.
 
 **Phase A - Cleanup (always runs):** Checks hosts in the force update group. If a host's sensor version now meets the source policy's target, it gets removed from the force group -- back to the normal maintenance-window-only policy.
 
-**Phase B - Enforcement (after grace period):** Looks up when the current build at the target standing first appeared in the collection. If the grace period has expired, finds hosts in the source group that are still behind and adds them to the force update group in batches.
+**Phase B - Enforcement (after grace period):** Looks up when the current build at the target standing was promoted to that standing. If the grace period has expired, finds hosts in the source group that are still behind and adds them to the force update group in batches. Hosts that report no usable sensor version are logged and skipped, never forced.
 
 ### Sensor Release Tracker UI
 
@@ -94,17 +94,19 @@ environment_variables:
 |----------|----------|---------|-------------|
 | `SOURCE_GROUP_ID` | Yes | | Host group ID with the maintenance-window policy |
 | `FORCE_UPDATE_GROUP_ID` | Yes | | Host group ID with the force-update policy (no blackout) |
-| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates (0-90) |
-| `PLATFORMS` | No | `windows` | Comma-separated platforms to enforce: `windows`, `mac`, `linux` |
-| `TARGET_STANDING` | No | | Override the standing detected from the source policy (e.g., `n-2`). Needed when the source policy's build string is untagged |
+| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a build reaches the target standing before forcing updates (0-90). An invalid value fails the run instead of falling back to the default |
+| `PLATFORMS` | No | `windows` | Comma-separated platforms to enforce: `windows`, `mac`, `linux` (case-insensitive) |
+| `TARGET_STANDING` | No | | Override the standing detected from the source policy (`n`, `n-1`, `n-2`). Needed when the source policy pins a specific build |
 | `DEBUG_MODE` | No | `false` | Enable verbose debug logging |
 
 ### Step 5: Build the UI and Deploy
 
 The manifest deploys the UI's `dist/` output as-is, so build it first:
 
+From the repository root:
+
 ```bash
-cd "Sensor Update Enforcer/ui/pages/Sensor Release Tracker"
+cd "ui/pages/Sensor Release Tracker"
 pnpm install && pnpm build
 cd ../../..
 foundry apps deploy --change-type Patch --change-log "description of changes"
@@ -279,7 +281,7 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 - Verify the source group's policy has a tagged build string (not untagged) -- or set the `TARGET_STANDING` env var to specify the standing manually
 
 **Hosts aren't being added to the force group**
-- Check that `GRACE_PERIOD_DAYS` has elapsed since the version first appeared
+- Check that `GRACE_PERIOD_DAYS` has elapsed since the target build was promoted to its standing (`days_since_release` in the response's `platform_details`)
 - Use `dry_run: true` to see what the app would do
 - Verify `SOURCE_GROUP_ID` points to the correct group
 - Check that the source policy is actually attached to the source group
@@ -289,16 +291,41 @@ The app requires these OAuth scopes (configured in `manifest.yml`):
 - Verify the host's `agent_version` actually meets the target (check the response)
 - Hosts on platforms not listed in `PLATFORMS` are skipped
 
+**A platform is skipped with "pinned to build ... with no release standing"**
+- The highest-precedence enabled policy on the source group pins a specific build, so there is no standing to enforce. Set `TARGET_STANDING` if you want to enforce one anyway
+
 **Response shows 207 (partial success)**
-- Some API operations failed. Check the `errors` array in the response
+- Some API operations failed. Check the `errors` array in the response -- each entry carries the Falcon API's own status and message
+- Only hosts whose add/remove call succeeded are listed in `added_hosts` / `removed_hosts`
 - Common cause: rate limiting on very large batch operations (thousands of hosts)
+
+**Response is a 4xx/5xx instead of 200/207**
+- 400: a setting is missing or invalid (the message names it)
+- Any other status from reading the source policy or force group is the Falcon API's own error, passed through unchanged
+
+---
+
+## Development
+
+Run each function's tests in a virtual environment (CI uses Python 3.14):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r functions/enforce-grace-period/requirements.txt pytest
+(cd functions/enforce-grace-period && ../../.venv/bin/python -m pytest -q)
+(cd functions/update-sensor-tracker && ../../.venv/bin/python -m pytest -q)
+```
+
+A repo-root `.venv` is never deployed. `__pycache__/` directories left by test runs are excluded through the manifest's `ignored` list.
+
+CI (`.github/workflows/ci.yml`) runs both test suites, builds the UI, and fails if the committed `src/dist` doesn't match the source.
 
 ---
 
 ## Project Structure
 
 ```
-Sensor Update Enforcer/
+.
 ├── manifest.yml                           # Foundry app manifest
 ├── README.md
 ├── ARCHITECTURE.md                        # Detailed flow diagram (Mermaid)
@@ -320,6 +347,7 @@ Sensor Update Enforcer/
 ├── ui/
 │   └── pages/
 │       └── Sensor Release Tracker/        # UI page: release standings dashboard (React + Vite)
-└── workflows/
-    └── workflow.yml                       # Bundled scheduled workflow (provisions on install)
+├── workflows/
+│   └── workflow.yml                       # Bundled scheduled workflow (provisions on install)
+└── .github/workflows/ci.yml               # Tests + UI build check
 ```

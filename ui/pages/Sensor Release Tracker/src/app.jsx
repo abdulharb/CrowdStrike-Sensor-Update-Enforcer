@@ -1,20 +1,21 @@
 import React from "react";
-import { HashRouter, Routes, Route, Navigate } from "react-router-dom";
+import ReactDOM from "react-dom/client";
+import SlSpinner from "@shoelace-style/shoelace/dist/react/spinner/index.js";
 import {
   useFalconApiContext,
   FalconApiContext,
 } from "./contexts/falcon-api-context";
 import { Home } from "./routes/home";
-import ReactDOM from "react-dom/client";
-import "@shoelace-style/shoelace/dist/components/spinner/spinner.js";
 
+// Single-view page: no router needed. Home renders for any path, including
+// the nav link's /sensor-release-tracker.
 function App() {
   const { falcon, navigation, isInitialized } = useFalconApiContext();
 
   if (!isInitialized) {
     return (
       <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh" }}>
-        <sl-spinner style={{ fontSize: "2.5rem" }} />
+        <SlSpinner style={{ fontSize: "2.5rem" }} />
       </div>
     );
   }
@@ -22,13 +23,7 @@ function App() {
   return (
     <React.StrictMode>
       <FalconApiContext.Provider value={{ falcon, navigation, isInitialized }}>
-        <HashRouter>
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/sensor-release-tracker" element={<Home />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </HashRouter>
+        <Home />
       </FalconApiContext.Provider>
     </React.StrictMode>
   );

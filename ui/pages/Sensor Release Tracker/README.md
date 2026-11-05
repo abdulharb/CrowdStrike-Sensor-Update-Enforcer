@@ -1,87 +1,61 @@
-# foundry-js-blueprint-react
+# Sensor Release Tracker (UI page)
 
-React blueprint for Foundry UI application development.  
+The app's homepage in the Falcon console. It reads the `sensor_release_tracker`
+collection and shows the current N / N-1 / N-2 build per platform, a
+filterable, sortable table of every tracked build, and each build's standing
+history.
 
-## Getting started
+Built with React, [foundry-js](https://github.com/CrowdStrike/foundry-js),
+[Falcon Shoelace](https://github.com/CrowdStrike/falcon-shoelace) and
+[Tailwind Toucan Base](https://github.com/CrowdStrike/tailwind-toucan-base),
+starting from the [Foundry React blueprint](https://github.com/CrowdStrike/foundry-js-blueprint-react).
 
-This project uses [pnpm](https://pnpm.io/) to manage dependencies.  Documentation to install `pnpm` is [here](https://pnpm.io/installation)
+## Layout
 
-- `pnpm install`
-- `pnpm watch`
+| Path | Purpose |
+|------|---------|
+| `src/app.jsx` | Connects to Falcon and renders the page |
+| `src/contexts/falcon-api-context.js` | Creates and connects the `FalconApi` instance |
+| `src/routes/home.jsx` | The dashboard |
+| `src/components/icons.jsx` | Inline SVG icons |
+| `src/styles.css` | Badge colors built from Toucan status tokens |
+| `src/dist/` | Build output. **This is what Foundry deploys** -- it is committed |
 
-`pnpm watch` will start [Vite](https://vite.dev/) in watch mode and your application's output will be under `/src/dist`.  The contents of `src/dist` is what will be rendered by Foundry.
+`vite.config.js` is the blueprint's, unchanged; Foundry's sandboxed iframe
+depends on it.
 
-## UI development
+## Develop
 
-Included in this blueprint are some common css and React components you can use in your app. They're already styled to be consistent with the rest of Falcon Console and handle light and dark mode for you.
+This project uses [pnpm](https://pnpm.io/installation).
 
-- [Shoelace](https://shoelace.style/frameworks/react) is already installed and we've also included [shoelace specific Falcon css](https://github.com/CrowdStrike/falcon-shoelace) to make the components provided by Shoelace look consistent with the rest of Falcon.
-
-- [Tailwind Toucan Base](https://github.com/CrowdStrike/tailwind-toucan-base) is a [tailwindcss](https://tailwindcss.com/) theme that gives you utility classes you can use in html or React components. You have the full power of tailwind in this boilerplate.  The Falcon specific [colors](https://tailwind-toucan-base.pages.dev/#Colors) are a great place to start in Tailwind Toucan Base.
-
-## Routing
-
-This blueprint provides a [Link](/src/components/link.jsx) component to help with routing in your Extension or Page and within Falcon Console.
-
-The `<Link>` component accepts these props:
-
-- `to` - the path to navigate to
-- `useFalconNavigation` - a boolean value indicating whether or not a link click will update the Falcon Console url.  Defaults to `false`
-- `openInNewTab` - a boolean value indicating whether the link should open in a new tab.  Defaults to `false`
-
-Setting `useFalconNavigation` to `true` will send the user to a new location within Falcon Console (this changes the Falcon Console url in the user's browser)
-
-By default `useFalconNavigation` is set to `false` and React Router (included in this blueprint) will handle user navigation and UI changes within your app.
-
-Usage of the `<Link>` component can be seen in the [home](/src/routes/home.jsx) and [navigation](/src/components/navigation.jsx) components.
-
-```jsx
-import { Link } from '../components/link';
-
-// navigates to https://falcon.crowdstrike.com/activity
-<Link useFalconNavigation={true} to="/activity">Activity Dashboard</Link>
-
-// navigates to an /about route within your Extension or Page
-<Link to="/about">About</Link>
+```bash
+pnpm install
+pnpm watch   # rebuilds src/dist on every change
 ```
 
-## Building your app
+Then run `foundry ui run` from the **app root** and enable Development mode in
+the Falcon console's Developer tools.
 
-Before deploying your Foundry app, you must do a final build of your UI extension so the app has access to the latest files in `/src/dist`.  Run the following build command when you're ready to deploy:
+Opened outside the console (for example `src/dist/index.html` served locally),
+the page gives up waiting for Falcon after 3 seconds and shows sample data
+under a "Preview mode" banner.
 
-- `pnpm build`
+## Build before deploying
 
-## App manifest updates
+Foundry deploys `src/dist` as-is and never builds the UI, so rebuild and commit
+it after every source change:
 
-### Add entries to your manifest's `ignored` field
-
-When deploying your app, the `dist` directory is required and everything else can be ignored.  
-
-Below are some starter regex patterns you can add to your app's `manifest.yml` file.
-
-```yaml
-ignored:
-    - ui/(extensions|pages)/[^\/]*?/public
-    - ui/(extensions|pages)/[^\/]*?/index.html
-    - ui/(extensions|pages)/[^\/]*?/favicon.ico
-    - ui/(extensions|pages)/.*?/node_modules
-    - ui/(extensions|pages)/.*?/config
-    - ui/(extensions|pages)/.*?/\.gitignore
-    - ui/(extensions|pages)/.*?/package\.json
-    - ui/(extensions|pages)/.*?/tsconfig\.json
-    - ui/(extensions|pages)/.*?/tsconfig\..*\.json
-    - ui/(extensions|pages)/.*?/.*?\.(md|log|lock|cjs)
+```bash
+pnpm build
 ```
 
-Here's an example of how to set your manifest's [ignored](https://github.com/CrowdStrike/foundry-sample-mitre/blob/main/manifest.yml#L5-L30) field.
+## Notes
 
-### Update your app's path and entrypoint
-
-When using this React template, you must add `/dist` to the app path and entrypoint in the manifest file.
-
-In the `manifest.yml` file, make the following changes (`{extensionName}` should be the name of your extension):
-
-- Set `path` to this: `ui/extensions/{extensionName}/src/dist`
-- Set `entrypoint` to this: `ui/extensions/{extensionName}/src/dist/index.html`
-
-Here's an example of how to set your manifest's [path and entrypoint](https://github.com/CrowdStrike/foundry-sample-mitre/blob/main/manifest.yml#L39-L40) fields.
+- Shoelace components are imported one at a time
+  (`@shoelace-style/shoelace/dist/react/<name>/index.js`). Importing the
+  `@shoelace-style/shoelace/dist/react` barrel registers every component and
+  more than doubles the bundle.
+- The prebuilt Toucan CSS has no responsive (`sm:`/`md:`) or arbitrary-value
+  (`max-h-[55vh]`) classes, so the page uses inline styles for those.
+- The sandboxed iframe blocks web storage and `alert`/`confirm`, so state is
+  kept in memory and errors are shown inline.

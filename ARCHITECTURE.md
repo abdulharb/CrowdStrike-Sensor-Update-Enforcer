@@ -20,22 +20,24 @@ flowchart TD
     subgraph F1["Foundry Function: update-sensor-tracker"]
         F1_START["POST /update-sensor-tracker"] --> F1_FETCH["Fetch sensor builds per platform<br/>SensorUpdatePolicies.query_combined_builds()"]
         F1_FETCH --> F1_PARSE["Parse build strings<br/>Extract release_standing: n, n-1, n-2, untagged<br/>Extract build_number"]
-        F1_PARSE --> F1_DEDUP["Check collection for existing entries"]
-        F1_DEDUP -->|New version at standing| F1_STORE["Store in collection<br/>first_seen_timestamp = now()"]
-        F1_DEDUP -->|Already exists| F1_SKIP["Skip"]
+        F1_PARSE --> F1_DEDUP["One entry per build (tagged copy wins)<br/>Read its record: {platform}_{build_number}"]
+        F1_DEDUP -->|New build| F1_STORE["Create record<br/>first_seen_timestamp = now()<br/>standing_updated_timestamp = now()"]
+        F1_DEDUP -->|Standing changed| F1_UPDATE["Update in place<br/>append old standing to previous_standings<br/>standing_updated_timestamp = now()"]
+        F1_DEDUP -->|Unchanged| F1_SKIP["Skip"]
     end
 
     F1_STORE --> COLLECTION
+    F1_UPDATE --> COLLECTION
     F1_SKIP -.-> COLLECTION
 
     subgraph COLLECTION["Foundry Collection: sensor_release_tracker"]
-        COL_DATA["Example entry:<br/>platform: 'Windows'<br/>sensor_version: '7.14.20407'<br/>release_standing: 'n-2'<br/>build_number: '20407'<br/>first_seen_timestamp: 1711670400"]
+        COL_DATA["Example entry (key windows_20407):<br/>platform: 'Windows'<br/>sensor_version: '7.14.20407'<br/>release_standing: 'n-2'<br/>build_number: '20407'<br/>first_seen_timestamp: 1709251200<br/>standing_updated_timestamp: 1711670400<br/>previous_standings: [n, n-1]"]
     end
 
     subgraph F2["Foundry Function: enforce-grace-period"]
         F2_START["POST /enforce-grace-period"] --> F2_CONFIG["Load config from env vars<br/>SOURCE_GROUP_ID<br/>FORCE_UPDATE_GROUP_ID<br/>GRACE_PERIOD_DAYS<br/>PLATFORMS<br/>TARGET_STANDING (optional)"]
 
-        F2_CONFIG --> F2_POLICY["Query source group's sensor update policy<br/>SensorUpdatePolicies.query_combined_policies_v2()<br/>Find policy attached to SOURCE_GROUP_ID"]
+        F2_CONFIG --> F2_POLICY["Query sensor update policies<br/>SensorUpdatePolicies.query_combined_policies_v2(sort=precedence.asc)<br/>Highest-precedence enabled policy<br/>attached to SOURCE_GROUP_ID, per platform"]
 
         F2_POLICY --> F2_TARGET["Extract target standing from policy<br/>e.g. 'n-2'"]
 
@@ -43,7 +45,7 @@ flowchart TD
 
         COLLECTION -.->|read| F2_COLLECTION
 
-        F2_COLLECTION --> F2_RESULT["Now we know:<br/>Target version: 7.14.20407 (current n-2)<br/>First seen: 1711670400<br/>Grace period threshold: first_seen + 3 days"]
+        F2_COLLECTION --> F2_RESULT["Now we know:<br/>Target version: 7.14.20407 (current n-2)<br/>Promoted to n-2 at: 1711670400<br/>Grace period threshold: standing_updated_timestamp + 3 days"]
 
         F2_RESULT --> PHASE_A
         F2_RESULT --> PHASE_B
@@ -55,10 +57,10 @@ flowchart TD
         end
 
         subgraph PHASE_B["Phase B: Enforcement (if grace period expired)"]
-            B0{"now - first_seen_timestamp<br/>>= GRACE_PERIOD_DAYS * 86400?"}
+            B0{"now - standing_updated_timestamp<br/>>= GRACE_PERIOD_DAYS * 86400?"}
             B0 -->|"No: grace period active<br/>(normal policy still has time)"| B_SKIP["Skip - let maintenance<br/>window handle it"]
             B0 -->|"Yes: grace period expired<br/>(host missed its window)"| B1["Get members of SOURCE group<br/>filtered by platform"]
-            B1 --> B2["For each member:<br/>- Skip if already in FORCE group<br/>- Skip if already at target version"]
+            B1 --> B2["For each member:<br/>- Skip if already in FORCE group<br/>- Skip if no usable agent_version<br/>- Skip if already at target version"]
             B2 --> B3["Add stale hosts to FORCE group<br/>in batches of 500"]
         end
     end
@@ -114,26 +116,22 @@ flowchart TD
 |-----------|------|---------|
 | `update-sensor-tracker` | Foundry Function (Python) | Polls sensor builds API, tracks version standings in collection |
 | `enforce-grace-period` | Foundry Function (Python) | Manages force-group membership based on grace period |
-| `sensor_release_tracker` | Foundry Collection | Stores version records with `first_seen_timestamp` for grace period math |
+| `sensor_release_tracker` | Foundry Collection | One record per build: current standing, `standing_updated_timestamp` (grace period anchor), and standing history |
 | Sensor Update Enforcer - Scheduled | Foundry Workflow (bundled, provisions on install) | Every 4 hours: tracker, 10-minute sleep, then enforcement |
 | Sensor Release Tracker | Foundry UI Page (React + Vite) | App homepage; dashboard of release standings and update history from the collection |
 
-## Environment Variables
+## Configuration and Setup
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SOURCE_GROUP_ID` | Yes | | Host group ID with the normal maintenance-window policy |
-| `FORCE_UPDATE_GROUP_ID` | Yes | | Host group ID with the force-update (no blackout) policy |
-| `GRACE_PERIOD_DAYS` | No | `3` | Days to wait after a new version appears before forcing updates (0-90) |
-| `PLATFORMS` | No | `windows` | Comma-separated platforms to enforce |
-| `TARGET_STANDING` | No | | Override the standing detected from the source policy (e.g., `n-2`); needed when the policy's build string is untagged |
-| `DEBUG_MODE` | No | `false` | Enable verbose debug logging |
+Environment variables, the policy and host group prerequisites, and the
+pre-production checklist live in the [README](README.md#setup-guide).
 
-## Prerequisites
+## Failure Handling
 
-1. Create a **source sensor update policy** with a maintenance window (e.g. blackout 9AM-5PM) targeting a specific standing (e.g. N-2)
-2. Create a **source host group** and attach it to the source policy. All managed hosts live here.
-3. Create a **force update policy** targeting the **same standing** but with **no blackout window**
-4. Create a **force update host group** and attach it to the force policy. This starts empty.
-5. Set `SOURCE_GROUP_ID` and `FORCE_UPDATE_GROUP_ID` env vars to the respective host group IDs
-6. Ensure the force policy has **higher precedence** (lower number) than the source policy
+- **Can't read the source policies or the force group:** the run stops before
+  changing anything and returns the Falcon API's own status and message.
+- **A collection lookup, source-group query, or add/remove batch fails:** that
+  step is recorded in `errors`, the rest of the run continues, and the response
+  is a 207. Only hosts whose add/remove call succeeded are reported as moved.
+- **update-sensor-tracker can't read a record:** that build is skipped and
+  reported, never recreated -- recreating it would reset its
+  `standing_updated_timestamp` and restart the grace period.

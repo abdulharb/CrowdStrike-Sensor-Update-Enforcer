@@ -1,21 +1,20 @@
 import react from '@vitejs/plugin-react-swc'
 
+// Unmodified Foundry React blueprint config. noAttr() strips `crossorigin`
+// from the built index.html, which Foundry's sandboxed iframe requires.
+const noAttr = () => ({
+  name: 'no-attribute',
+  transformIndexHtml(html) {
+    return html.replace(/ crossorigin(?:="[^"]*")?/g, '')
+  }
+})
+
 /** @type {import('vite').UserConfig} */
 export default {
   plugins: [
-    react()
+    react(),
+    noAttr()
   ],
-  base: './',
   root: 'src',
-  build: {
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'shoelace': ['@shoelace-style/shoelace'],
-          'foundry': ['@crowdstrike/foundry-js'],
-        },
-      },
-    },
-  },
+  base: './'
 };

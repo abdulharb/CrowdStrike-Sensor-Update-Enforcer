@@ -7,8 +7,13 @@ function useFalconApiContext() {
   const [isInitialized, setIsInitialized] = useState(false);
   const falcon = useMemo(() => new FalconApi(), []);
   // isInitialized (React state) is the reactive dep — falcon.isConnected is a
-  // plain property and won't trigger recomputation on its own.
-  const navigation = useMemo(() => (isInitialized ? falcon.navigation : undefined), [isInitialized, falcon]);
+  // plain property and won't trigger recomputation on its own. The
+  // falcon.navigation getter throws when not connected, so after the preview
+  // timeout below it must not be touched.
+  const navigation = useMemo(
+    () => (isInitialized && falcon.isConnected ? falcon.navigation : undefined),
+    [isInitialized, falcon]
+  );
 
   useEffect(() => {
     let cancelled = false;
